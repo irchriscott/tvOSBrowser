@@ -80,33 +80,21 @@ static NSString * const kEditableElementSelector = @"input, textarea, select, [c
                             "return null;"
                         "}"
                         // Shared video helpers. A video only counts as "the video under the cursor" when it
-                        // is a real player: background/hero videos (muted + autoplay/loop, no controls)
-                        // are decoration, and a button or link that is not part of the player belongs to
-                        // the page (e.g. a "Play" button over a trailer that opens the real movie).
+                        // is a real player and nothing clickable sits on top of it: background/hero videos
+                        // (muted + autoplay/loop, no controls) are decoration, and any button or link that
+                        // is not the video itself belongs to the page - including the player's own controls
+                        // (play, settings, subtitles, servers...), which must receive the click.
                         "function browserIsDecorativeVideo(video) {"
                             "if (!video) { return true; }"
                             "if (video.controls) { return false; }"
                             "return !!video.muted && (!!video.loop || !!video.autoplay);"
                         "}"
-                        "function browserElementBelongsToVideo(element, video) {"
-                            "if (!element || !video) { return false; }"
-                            "if (element === video || (video.contains && video.contains(element))) { return true; }"
-                            "var videoRect = video.getBoundingClientRect();"
-                            "var videoArea = Math.max(1, videoRect.width * videoRect.height);"
-                            "var container = video.parentElement;"
-                            "var depth = 0;"
-                            "while (container && depth < 4) {"
-                                "var containerRect = container.getBoundingClientRect();"
-                                "if (containerRect.width * containerRect.height > videoArea * 1.35) { break; }"
-                                "if (container.contains(element)) { return true; }"
-                                "container = container.parentElement;"
-                                "depth += 1;"
-                            "}"
-                            "return false;"
+                        "function browserElementIsVideo(element, video) {"
+                            "return !!element && !!video && (element === video || (video.contains && video.contains(element)));"
                         "}"
                         "function browserIsUsableVideo(video) {"
                             "if (!video || browserIsDecorativeVideo(video)) { return false; }"
-                            "if (interactiveElement && !browserElementBelongsToVideo(interactiveElement, video)) { return false; }"
+                            "if (interactiveElement && !browserElementIsVideo(interactiveElement, video)) { return false; }"
                             "return true;"
                         "}"
                         "var resolvedElement = resolveElement(document, x, y);"
@@ -169,7 +157,20 @@ static NSString * const kEditableElementSelector = @"input, textarea, select, [c
 
     return [self evaluateResolvedElementJavaScriptAtPoint:point
                                                   webView:webView
-                                                     body:@"var candidate = interactiveElement || resolvedElement;"
+                                                     body:@"function browserMouseEvent(target, type, related) {"
+                                                              "if (!target) { return; }"
+                                                              "var init = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y, relatedTarget: related || null, pointerType: 'mouse', isPrimary: true };"
+                                                              "try { target.dispatchEvent(type.indexOf('pointer') === 0 && window.PointerEvent ? new PointerEvent(type, init) : new MouseEvent(type, init)); } catch (e) {}"
+                                                          "}"
+                                                          // Act like a real mouse so pages reveal hover UI (e.g. video player controls that hide after a few seconds).
+                                                          "var previous = window.__browserHoverTarget;"
+                                                          "if (resolvedElement && previous !== resolvedElement) {"
+                                                              "if (previous && document.contains(previous)) { browserMouseEvent(previous, 'pointerout', resolvedElement); browserMouseEvent(previous, 'mouseout', resolvedElement); }"
+                                                              "browserMouseEvent(resolvedElement, 'pointerover', previous); browserMouseEvent(resolvedElement, 'mouseover', previous);"
+                                                              "window.__browserHoverTarget = resolvedElement;"
+                                                          "}"
+                                                          "browserMouseEvent(resolvedElement, 'pointermove'); browserMouseEvent(resolvedElement, 'mousemove');"
+                                                          "var candidate = interactiveElement || resolvedElement;"
                                                           "while (candidate) {"
                                                               "if (candidate.matches && candidate.matches(interactiveSelector)) { return 'true'; }"
                                                               "candidate = candidate.parentElement;"
@@ -260,7 +261,8 @@ static NSString * const kEditableElementSelector = @"input, textarea, select, [c
                                                                            "poster: browserAbsoluteURL(video.poster || ''),"
                                                                            "title: video.getAttribute('title') || video.getAttribute('aria-label') || document.title || '',"
                                                                            "tagName: video.tagName ? video.tagName.toLowerCase() : '',"
-                                                                           "paused: !!video.paused"
+                                                                           "paused: !!video.paused,"
+                                                                           "currentTime: video.currentTime || 0"
                                                                        "});"];
     return [self JSONObjectFromJavaScriptString:result];
 }
@@ -350,7 +352,8 @@ static NSString * const kEditableElementSelector = @"input, textarea, select, [c
                                                                            "poster: browserAbsoluteURL(video.poster || ''),"
                                                                            "title: video.getAttribute('title') || video.getAttribute('aria-label') || document.title || '',"
                                                                            "tagName: video.tagName ? video.tagName.toLowerCase() : '',"
-                                                                           "paused: !!video.paused"
+                                                                           "paused: !!video.paused,"
+                                                                           "currentTime: video.currentTime || 0"
                                                                        "});"];
     return [self JSONObjectFromJavaScriptString:result];
 }
@@ -432,9 +435,7 @@ static NSString * const kEditableElementSelector = @"input, textarea, select, [c
                                                                            "}"
                                                                            "return false;"
                                                                        "}"
-                                                                       "if (browserLooksLikeNavigationTarget(interactiveElement) &&"
-                                                                           "!browserContainsVideoAncestor(interactiveElement) &&"
-                                                                           "!browserMatchesVideoIntent(interactiveElement)) {"
+                                                                       "if (interactiveElement && !browserContainsVideoAncestor(interactiveElement)) {"
                                                                            "return 'false';"
                                                                        "}"
                                                                        "var candidate = resolvedElement;"
@@ -573,7 +574,8 @@ static NSString * const kEditableElementSelector = @"input, textarea, select, [c
                                                            "poster: browserAbsoluteURL(video.poster || ''),"
                                                            "title: video.getAttribute('title') || video.getAttribute('aria-label') || document.title || '',"
                                                            "tagName: video.tagName ? video.tagName.toLowerCase() : '',"
-                                                           "paused: !!video.paused"
+                                                           "paused: !!video.paused,"
+                                                                           "currentTime: video.currentTime || 0"
                                                        "});"
                                                    "}"
                                                    "var video = browserResolveVideoElement();"

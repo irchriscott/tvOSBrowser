@@ -31,6 +31,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly, nullable) BrowserTabViewModel *activeTab;
 @property (nonatomic, readonly) BOOL showingHome;
 @property (nonatomic, readonly, nullable) BrowserHomeView *homeView;
+/// A page is in (emulated) fullscreen: the web view fills the screen and the top bar is hidden.
+@property (nonatomic, readonly) BOOL pageFullscreenActive;
 @property (nonatomic, copy) NSString *requestURL;
 @property (nonatomic, copy) NSString *previousURL;
 
@@ -73,6 +75,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// Reloads the active tab if it is showing the "page stopped responding" overlay.
 /// Returns YES when it did, so the caller can skip its own Select handling.
 - (BOOL)reloadCrashedActiveTabIfNeeded;
+- (void)setPageFullscreen:(BOOL)fullscreen forWebView:(id)webView;
 - (void)prepareTabForRequest:(NSURLRequest *)request webView:(id)webView;
 - (void)setTopNavigationVisible:(BOOL)visible;
 - (BrowserTabViewModel *)tabForWebView:(id)webView;

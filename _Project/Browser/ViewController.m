@@ -6,7 +6,11 @@
 //  Improved by Jip van Akker on 14/10/2015 through 10/01/2019
 //
 
+#import <AVKit/AVKit.h>
+
+#import "BrowserAdBlocker.h"
 #import "BrowserMenuCoordinator.h"
+#import "BrowserPageNavigator.h"
 #import "BrowserDOMInteractionService.h"
 #import "BrowserHomeView.h"
 #import "BrowserNavigationService.h"
@@ -47,6 +51,9 @@ static UIColor *kTextColor(void) {
 @property (nonatomic) BOOL displayedHintsOnLaunch;
 @property (nonatomic) BOOL scrollViewAllowBounces;
 @property (nonatomic, getter=isTopBarFocusActive) BOOL topBarFocusActive;
+@property (nonatomic) BrowserPageNavigator *pageNavigator;
+@property (nonatomic) UIVisualEffectView *toastView;
+@property (nonatomic) UILabel *toastLabel;
 @property (nonatomic) BOOL homeWasVisible;
 /// Cursor/scroll mode to return to on web pages; Home always runs without the cursor.
 @property (nonatomic) BOOL cursorModeBeforeHome;
@@ -72,6 +79,7 @@ static UIColor *kTextColor(void) {
     self.viewModel.fullscreenVideoPlaybackEnabled = self.preferencesStore.fullscreenVideoPlaybackEnabled;
 
     self.domInteractionService = [BrowserDOMInteractionService new];
+    self.pageNavigator = [BrowserPageNavigator new];
     self.navigationService = [[BrowserNavigationService alloc] initWithPreferencesStore:self.preferencesStore];
     self.sessionStore = [BrowserSessionStore new];
     self.menuCoordinator = [[BrowserMenuCoordinator alloc] initWithHost:self preferencesStore:self.preferencesStore];
@@ -118,6 +126,10 @@ static UIColor *kTextColor(void) {
                                                  name:UIApplicationWillTerminateNotification
                                                object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handlePopupBlockedNotification:)
+                                                 name:BrowserAdBlockerDidBlockPopupNotification
+                                               object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(handleGlobalSelectPressEndedNotification:)
                                                  name:kBrowserGlobalSelectPressEndedNotification
                                                object:nil];
@@ -159,6 +171,11 @@ static UIColor *kTextColor(void) {
     [self.tabCoordinator persistSession];
 }
 
+- (void)handlePopupBlockedNotification:(NSNotification *)notification {
+    (void)notification;
+    [self showToast:@"Blocked a pop-up"];
+}
+
 - (void)handleGlobalSelectPressEndedNotification:(NSNotification *)notification {
     (void)notification;
     if (self.tabCoordinator.showingHome) {
@@ -168,6 +185,64 @@ static UIColor *kTextColor(void) {
 }
 
 #pragma mark - Helpers
+
+/// Short message near the bottom of the screen (mode changes, blocked pop-ups).
+- (void)showToast:(NSString *)message {
+    if (self.toastView == nil) {
+        UIVisualEffectView *toastView = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
+        toastView.userInteractionEnabled = NO;
+        toastView.clipsToBounds = YES;
+        toastView.alpha = 0.0;
+        UILabel *label = [UILabel new];
+        label.textColor = UIColor.whiteColor;
+        label.font = [UIFont systemFontOfSize:28.0 weight:UIFontWeightSemibold];
+        label.textAlignment = NSTextAlignmentCenter;
+        label.numberOfLines = 2;
+        [toastView.contentView addSubview:label];
+        [self.view addSubview:toastView];
+        self.toastView = toastView;
+        self.toastLabel = label;
+    }
+
+    self.toastLabel.text = message;
+    CGSize maxSize = CGSizeMake(MIN(1300.0, CGRectGetWidth(self.view.bounds) - 160.0), 200.0);
+    CGSize textSize = [self.toastLabel sizeThatFits:maxSize];
+    textSize.width = MIN(ceil(textSize.width), maxSize.width);
+    CGSize toastSize = CGSizeMake(textSize.width + 72.0, ceil(textSize.height) + 36.0);
+    self.toastView.frame = CGRectMake(floor((CGRectGetWidth(self.view.bounds) - toastSize.width) / 2.0),
+                                      CGRectGetHeight(self.view.bounds) - toastSize.height - 90.0,
+                                      toastSize.width,
+                                      toastSize.height);
+    self.toastView.layer.cornerRadius = MIN(toastSize.height / 2.0, 36.0);
+    self.toastLabel.frame = CGRectInset(self.toastView.bounds, 36.0, 18.0);
+    [self.view bringSubviewToFront:self.toastView];
+    [self.view bringSubviewToFront:self.remoteInputController.cursorView];
+
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideToast) object:nil];
+    [UIView animateWithDuration:0.2 animations:^{
+        self.toastView.alpha = 1.0;
+    }];
+    [self performSelector:@selector(hideToast) withObject:nil afterDelay:2.6];
+}
+
+- (void)hideToast {
+    [UIView animateWithDuration:0.35 animations:^{
+        self.toastView.alpha = 0.0;
+    }];
+}
+
+/// Navigation mode: Select opens whatever the page highlight is on.
+- (void)activateHighlightedPageElement {
+    if (self.webview == nil || self.tabCoordinator.showingHome) {
+        return;
+    }
+    NSValue *point = [self.pageNavigator activationPointInWebView:self.webview];
+    if (point == nil) {
+        [self showToast:@"Click the edges of the remote's touch surface to pick a link"];
+        return;
+    }
+    [self.pageActionCoordinator handlePageSelectionAtDOMPoint:point.CGPointValue webView:self.webview];
+}
 
 - (BrowserWebView *)webview {
     return self.tabCoordinator.activeWebView;
@@ -450,7 +525,7 @@ static UIColor *kTextColor(void) {
 
 - (void)showHintsAlert {
     UIAlertController *alertController = [UIAlertController alertControllerWithTitle:@"Usage Guide"
-                                                                             message:@"Double press the touch area to switch between cursor & scroll mode.\nPress the touch area while in cursor mode to click.\nSingle tap to Menu button to Go Back, or Exit on root page.\nSingle tap the Play/Pause button to: Go Forward, Enter URL or Reload Page.\nDouble tap the Play/Pause to show the Advanced Menu with more options.\nUse the tabs icon in the top bar to open the tab overview."
+                                                                             message:@"Double press the touch area to switch between cursor & navigation mode.\nPress the touch area while in cursor mode to click.\nIn navigation mode, click the edges of the touch surface to move between links and buttons, swipe to scroll, and press Select to open.\nSingle tap to Menu button to Go Back, or Exit on root page.\nSingle tap the Play/Pause button to: Go Forward, Enter URL or Reload Page.\nDouble tap the Play/Pause to show the Advanced Menu with more options.\nUse the tabs icon in the top bar to open the tab overview."
                                                                       preferredStyle:UIAlertControllerStyleAlert];
 
     __weak typeof(self) weakSelf = self;
@@ -477,7 +552,11 @@ static UIColor *kTextColor(void) {
     if ([self.tabCoordinator reloadCrashedActiveTabIfNeeded]) {
         return;
     }
-    if (!self.remoteInputController.cursorModeEnabled || self.webview == nil) {
+    if (!self.remoteInputController.cursorModeEnabled) {
+        [self activateHighlightedPageElement];
+        return;
+    }
+    if (self.webview == nil) {
         return;
     }
 
@@ -753,6 +832,8 @@ static UIColor *kTextColor(void) {
     UIAlertController *alertController = (UIAlertController *)self.presentedViewController;
     if (alertController != nil) {
         [self.presentedViewController dismissViewControllerAnimated:YES completion:nil];
+    } else if (self.tabCoordinator.pageFullscreenActive) {
+        [self exitPageFullscreen];
     } else if ([self.tabCoordinator returnFromHomeToPage]) {
         return;
     } else if (!self.tabCoordinator.showingHome && self.webview.canGoBack) {
@@ -804,11 +885,41 @@ static UIColor *kTextColor(void) {
     [self.tabCoordinator persistSession];
 }
 
+- (void)browserRemoteInputControllerHandleNavigationPress:(UIPressType)pressType {
+    if (self.webview == nil || self.tabCoordinator.showingHome) {
+        return;
+    }
+    BrowserPageNavigationDirection direction = BrowserPageNavigationDirectionDown;
+    switch (pressType) {
+        case UIPressTypeUpArrow: direction = BrowserPageNavigationDirectionUp; break;
+        case UIPressTypeLeftArrow: direction = BrowserPageNavigationDirectionLeft; break;
+        case UIPressTypeRightArrow: direction = BrowserPageNavigationDirectionRight; break;
+        default: break;
+    }
+    __weak typeof(self) weakSelf = self;
+    [self.pageNavigator moveInDirection:direction webView:self.webview completion:^(BrowserPageNavigationResult result) {
+        if (result == BrowserPageNavigationResultTopEdge && direction == BrowserPageNavigationDirectionUp) {
+            [weakSelf activateTopBarFocusMode];
+        }
+    }];
+}
+
+- (void)browserRemoteInputControllerDidToggleCursorMode:(BOOL)cursorModeEnabled {
+    if (cursorModeEnabled) {
+        [self.pageNavigator clearInWebView:self.webview];
+        [self showToast:@"Cursor mode"];
+    } else {
+        [self showToast:@"Navigation mode · click the remote's edges to move, Select to open"];
+    }
+}
+
 #pragma mark - BrowserWebViewDelegate
 
 - (BOOL)webView:(id)webView shouldCreateNewTabWithRequest:(NSURLRequest *)request navigationType:(NSInteger)navigationType {
-    (void)webView;
-    (void)navigationType;
+    NSURL *sourceURL = [webView request].URL;
+    if ([[BrowserAdBlocker sharedBlocker] shouldBlockPopupRequest:request navigationType:navigationType sourceURL:sourceURL]) {
+        return YES; // handled: the pop-up is dropped
+    }
     return [self.tabCoordinator createNewTabWithRequest:request];
 }
 
@@ -826,12 +937,223 @@ static UIColor *kTextColor(void) {
     [self.tabCoordinator webView:webView didChangeLoadProgress:progress loading:loading];
 }
 
+- (void)webView:(id)webView didChangePageFullscreen:(BOOL)fullscreen {
+    if (webView != self.webview) {
+        return;
+    }
+    [self deactivateTopBarFocusMode];
+    [self.tabCoordinator setPageFullscreen:fullscreen forWebView:webView];
+    if (fullscreen) {
+        [self showToast:@"Full screen · press Menu to exit"];
+    }
+}
+
+- (void)exitPageFullscreen {
+    [self.webview evaluateJavaScript:@"window.__browserExitFullscreen && window.__browserExitFullscreen();" completionHandler:nil];
+    [self.tabCoordinator setPageFullscreen:NO forWebView:nil];
+}
+
 - (void)webViewContentProcessDidTerminate:(id)webView {
     [self.tabCoordinator webViewContentProcessDidTerminate:webView];
 }
 
+- (void)runNavigationDiagnosticsIfRequested:(id)webView {
+    // Launch with -BrowserNavDiagnostics YES: simulates remote arrow presses and logs the highlighted element.
+    static BOOL ranOnce = NO;
+    if (ranOnce || ![[NSUserDefaults standardUserDefaults] boolForKey:@"BrowserNavDiagnostics"] || webView != self.webview) {
+        return;
+    }
+    ranOnce = YES;
+    NSArray<NSNumber *> *steps = @[@(BrowserPageNavigationDirectionDown), @(BrowserPageNavigationDirectionDown),
+                                   @(BrowserPageNavigationDirectionRight), @(BrowserPageNavigationDirectionRight),
+                                   @(BrowserPageNavigationDirectionDown), @(BrowserPageNavigationDirectionRight),
+                                   @(BrowserPageNavigationDirectionLeft), @(BrowserPageNavigationDirectionUp)];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(14.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Select test: open the highlighted element, then report where the tab went.
+        printf("[BNAV] select on highlighted element (page %s)\n", self.webview.request.URL.absoluteString.UTF8String);
+        fflush(stdout);
+        [self activateHighlightedPageElement];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            printf("[BNAV] after select: tab is at %s\n", self.webview.request.URL.absoluteString.UTF8String);
+            fflush(stdout);
+        });
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Pop-up test: a script-opened window to another site should be refused by the ad blocker.
+        [self.webview evaluateJavaScript:@"(function(){var w=window.open('https://www.example.org/','_blank'); return w ? 'window object returned' : 'no window';})()"
+                       completionHandler:^(id result, NSError *error) {
+            printf("[BNAV] popup test: %s %s\n", [[result description] UTF8String], error ? error.localizedDescription.UTF8String : "");
+            fflush(stdout);
+        }];
+    });
+    NSArray<NSString *> *names = @[@"up", @"down", @"left", @"right"];
+    [steps enumerateObjectsUsingBlock:^(NSNumber *step, NSUInteger index, __unused BOOL *stop) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((4.0 + index * 1.2) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            BrowserWebView *currentWebView = self.webview;
+            CFTimeInterval start = CACurrentMediaTime();
+            [self.pageNavigator moveInDirection:(BrowserPageNavigationDirection)step.integerValue webView:currentWebView completion:^(BrowserPageNavigationResult result) {
+                double elapsed = (CACurrentMediaTime() - start) * 1000.0;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [currentWebView evaluateJavaScript:@"(function(){var e=window.__bnav&&window.__bnav.current; if(!e){return 'none';} var r=e.getBoundingClientRect(); return e.tagName+' \"'+(e.innerText||e.getAttribute('aria-label')||e.getAttribute('href')||'').trim().replace(/\\s+/g,' ').slice(0,50)+'\" at '+Math.round(r.left)+','+Math.round(r.top)+' '+Math.round(r.width)+'x'+Math.round(r.height)+' scrollY='+Math.round(scrollY)+' highlight='+(window.__bnav.siteStyled?'site focus style':'blue ring');})()"
+                                 completionHandler:^(id description, __unused NSError *error) {
+                    printf("[BNAV] press %s -> result %ld in %.0fms: %s\n", names[step.integerValue].UTF8String, (long)result, elapsed, [[description description] UTF8String]);
+                    fflush(stdout);
+                }];
+                });
+            }];
+        });
+    }];
+}
+
+/// Clicks the first visible element whose text/label matches `pattern`, through the same path a remote Select uses.
+- (NSString *)diagnosticsClickElementMatching:(NSString *)pattern {
+    NSString *script = [NSString stringWithFormat:@"(function(){var re=new RegExp(%@,'i'); var buttons=document.querySelectorAll('button,[role=button]'); for(var j=0;j<buttons.length;j++){var b=buttons[j]; var br=b.getBoundingClientRect(); var bl=(b.getAttribute('aria-label')||b.getAttribute('title')||'').trim(); if(br.width>4&&br.height>4&&bl&&re.test(bl)){return JSON.stringify({x:br.left+br.width/2,y:br.top+br.height/2,t:bl,tag:b.tagName});}} var els=document.querySelectorAll('button,[role=button],[role=menuitem],[role=menuitemradio],[role=option],li,a,label,div,span'); var best=null; for(var i=0;i<els.length;i++){var e=els[i]; var r=e.getBoundingClientRect(); if(r.width<4||r.height<4||r.bottom<0||r.top>innerHeight){continue;} var cs=getComputedStyle(e); if(cs.visibility==='hidden'||cs.display==='none'||parseFloat(cs.opacity)<0.1){continue;} var t=(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').trim().replace(/\\s+/g,' '); if(t.length>40||!re.test(t)){continue;} if(!best||r.width*r.height<best.a){best={a:r.width*r.height,x:r.left+r.width/2,y:r.top+r.height/2,t:t,tag:e.tagName};}} return best?JSON.stringify(best):'';})()", [self diagnosticsJSONString:pattern]];
+    NSString *json = [self.webview stringByEvaluatingJavaScriptFromString:script];
+    NSDictionary *target = json.length > 0 ? [NSJSONSerialization JSONObjectWithData:[json dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
+    if (![target isKindOfClass:[NSDictionary class]]) {
+        return [NSString stringWithFormat:@"nothing matching /%@/", pattern];
+    }
+    [self.pageActionCoordinator handlePageSelectionAtDOMPoint:CGPointMake([target[@"x"] doubleValue], [target[@"y"] doubleValue]) webView:self.webview];
+    return [NSString stringWithFormat:@"clicked %@ '%@'", target[@"tag"], target[@"t"]];
+}
+
+- (NSString *)diagnosticsJSONString:(NSString *)string {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@[string] options:0 error:nil];
+    NSString *array = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return [array substringWithRange:NSMakeRange(1, array.length - 2)];
+}
+
+- (void)diagnosticsLog:(NSString *)label script:(NSString *)script {
+    NSString *result = script.length > 0 ? [self.webview stringByEvaluatingJavaScriptFromString:script] : @"";
+    printf("[BQUAL] %s %s\n", label.UTF8String, (result ?: @"").UTF8String);
+    fflush(stdout);
+}
+
+- (void)runPlayerQualityAndFullscreenDiagnostics {
+    NSString *videoState = @"(function(){var v=document.querySelector('video'); if(!v){return 'no video';} return 'src='+String(v.currentSrc).slice(-40)+' size='+v.videoWidth+'x'+v.videoHeight+' rs='+v.readyState+' paused='+v.paused+' t='+v.currentTime.toFixed(1)+' fsElement='+((document.fullscreenElement||document.webkitFullscreenElement||{}).tagName||'none')+' presentation='+v.webkitPresentationMode+' rect='+Math.round(v.getBoundingClientRect().width)+'x'+Math.round(v.getBoundingClientRect().height);})()";
+    NSString *menuText = @"(function(){var out=[]; var els=document.querySelectorAll('[role=menu] *,[role=dialog] *,[class*=menu] *,[class*=settings] *,[class*=popover] *,[class*=panel] *'); for(var i=0;i<els.length;i++){var e=els[i]; if(e.children.length){continue;} var r=e.getBoundingClientRect(); if(r.width<2||r.height<2){continue;} var t=(e.innerText||'').trim(); if(t&&out.indexOf(t)===-1){out.push(t);}} return JSON.stringify(out.slice(0,40));})()";
+    NSString *mode = [[NSUserDefaults standardUserDefaults] stringForKey:@"BrowserPlayerTestMode"] ?: @"fullscreen";
+    NSArray *steps = [mode isEqualToString:@"native"] ? @[
+        @[@0.0, @"start", @"(function(){var v=document.querySelector('video'); if(v){v.play();} return 'play() called';})()"],
+        @[@6.0, @"state", videoState],
+        @[@7.0, @"native-player", @""],
+        @[@15.0, @"native-state", @""],
+        @[@23.0, @"native-state", @""],
+        @[@31.0, @"native-state", @""],
+    ] : @[
+        @[@0.0, @"start", @"(function(){var v=document.querySelector('video'); if(v){v.play();} return 'play() called';})()"],
+        @[@6.0, @"state", videoState],
+        @[@7.0, @"hover-fullscreen", @""],
+        @[@8.0, @"click", @"^fullscreen$"],
+        @[@11.0, @"state", videoState],
+        @[@14.0, @"state", videoState],
+        @[@15.0, @"menu-press", @""],
+        @[@17.0, @"state", videoState],
+    ];
+    for (NSArray *step in steps) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((10.0 + [step[0] doubleValue]) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if ([step[1] isEqualToString:@"click"]) {
+                printf("[BQUAL] %s\n", [self diagnosticsClickElementMatching:step[2]].UTF8String);
+                fflush(stdout);
+            } else if ([step[1] isEqualToString:@"hover-fullscreen"]) {
+                NSString *where = [self.webview stringByEvaluatingJavaScriptFromString:@"(function(){var b=document.querySelector('button[aria-label=Fullscreen]'); if(!b){return '';} var r=b.getBoundingClientRect(); return (r.left+r.width/2)+','+(r.top+r.height/2)+','+getComputedStyle(b).opacity+','+getComputedStyle(b.parentElement).opacity;})()"];
+                NSArray *parts = [where componentsSeparatedByString:@","];
+                if (parts.count >= 2) {
+                    [self.domInteractionService evaluateHoverStateJavaScriptAtPoint:CGPointMake([parts[0] doubleValue], [parts[1] doubleValue]) webView:self.webview];
+                }
+                NSString *after = [self.webview stringByEvaluatingJavaScriptFromString:@"(function(){var b=document.querySelector('button[aria-label=Fullscreen]'); return b ? getComputedStyle(b).opacity+','+getComputedStyle(b.parentElement).opacity : '';})()"];
+                printf("[BQUAL] cursor moved over Fullscreen button (x,y,opacity,barOpacity before=%s; after=%s)\n", where.UTF8String ?: "", after.UTF8String ?: "");
+                fflush(stdout);
+            } else if ([step[1] isEqualToString:@"menu-press"]) {
+                printf("[BQUAL] Menu press (fullscreen active=%d)\n", self.tabCoordinator.pageFullscreenActive);
+                fflush(stdout);
+                [self browserRemoteInputControllerHandleMenuPress];
+            } else if ([step[1] isEqualToString:@"native-player"]) {
+                printf("[BQUAL] TV output: nativeBounds=%s scale=%.1f\n", NSStringFromCGRect(UIScreen.mainScreen.nativeBounds).UTF8String, UIScreen.mainScreen.nativeScale);
+                NSString *info = [self.webview stringByEvaluatingJavaScriptFromString:@"(function(){var v=document.querySelector('video'); return v ? JSON.stringify({src:v.currentSrc, t:v.currentTime}) : '';})()"];
+                NSDictionary *video = info.length > 0 ? [NSJSONSerialization JSONObjectWithData:[info dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
+                printf("[BQUAL] opening native player at t=%.1f quality pref=%s\n", [video[@"t"] doubleValue], [[[NSUserDefaults standardUserDefaults] stringForKey:@"NativePlayerPreferredQuality"] ?: @"auto" UTF8String]);
+                fflush(stdout);
+                if (video[@"src"] != nil) {
+                    [self.videoPlaybackCoordinator presentNativeVideoPlayerForURL:[NSURL URLWithString:video[@"src"]] title:@"Test" startTime:[video[@"t"] doubleValue]];
+                }
+            } else if ([step[1] isEqualToString:@"native-state"]) {
+                AVPlayerViewController *player = [self.presentedViewController isKindOfClass:[AVPlayerViewController class]] ? (AVPlayerViewController *)self.presentedViewController : nil;
+                AVPlayerItemAccessLogEvent *event = player.player.currentItem.accessLog.events.lastObject;
+                BOOL hdrEligible = NO;
+                if (@available(tvOS 13.4, *)) {
+                    hdrEligible = AVPlayer.eligibleForHDRPlayback;
+                }
+                printf("[BQUAL] native player: presented=%s status=%ld rate=%.1f t=%.1f presentationSize=%s indicatedBitrate=%.0f observedBitrate=%.0f HDReligible=%d error=%s\n", player ? "yes" : "no", (long)player.player.currentItem.status, player.player.rate, CMTimeGetSeconds(player.player.currentTime), NSStringFromCGSize(player.player.currentItem.presentationSize).UTF8String, event.indicatedBitrate, event.observedBitrate, hdrEligible, player.player.currentItem.error.localizedDescription.UTF8String ?: "none");
+                fflush(stdout);
+            } else if ([step[1] isEqualToString:@"native-close"]) {
+                [self.presentedViewController dismissViewControllerAnimated:YES completion:nil];
+            } else {
+                [self diagnosticsLog:step[1] script:step[2]];
+            }
+            if ([step[1] isEqualToString:@"state"]) {
+                printf("[BQUAL] presented=%s webViewFrame=%s topBarHidden=%d\n", self.presentedViewController ? NSStringFromClass(self.presentedViewController.class).UTF8String : "(none)", NSStringFromCGRect(self.webview.frame).UTF8String, self.topMenuView.hidden);
+                fflush(stdout);
+            }
+        });
+    }
+}
+
+- (void)runPlayerControlsDiagnosticsIfRequested:(id)webView {
+    // Launch with -BrowserPlayerControlsDiagnostics YES on a video page: presses the player's
+    // settings/subtitles/servers buttons the way a remote Select would and logs what happens.
+    static BOOL ranOnce = NO;
+    if (ranOnce || ![[NSUserDefaults standardUserDefaults] boolForKey:@"BrowserPlayerControlsDiagnostics"] || webView != self.webview) {
+        return;
+    }
+    ranOnce = YES;
+    printf("[BCTRL] full screen player enabled: %s\n", self.viewModel.fullscreenVideoPlaybackEnabled ? "YES" : "NO");
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"BrowserPlayerQualityDiagnostics"]) {
+        [self runPlayerQualityAndFullscreenDiagnostics];
+        return;
+    }
+    NSString *listScript = @"(function(){var v=document.querySelector('video'); if(!v){return '[]';} var out=[]; var els=document.querySelectorAll('button,[role=button]'); for(var i=0;i<els.length;i++){var e=els[i]; var r=e.getBoundingClientRect(); if(r.width<4||r.height<4){continue;} var label=(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').trim().replace(/\\s+/g,' ').slice(0,30); out.push({label:label,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});} return JSON.stringify(out);})()";
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSString *json = [self.webview stringByEvaluatingJavaScriptFromString:listScript];
+        for (NSUInteger attempt = 0; (json.length == 0 || [json isEqualToString:@"[]"]) && attempt < 12; attempt++) {
+            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
+            json = [self.webview stringByEvaluatingJavaScriptFromString:listScript];
+        }
+        printf("[BCTRL] player buttons: %s\n", json.UTF8String ?: "(none)");
+        fflush(stdout);
+        NSData *jsonData = [json dataUsingEncoding:NSUTF8StringEncoding];
+        NSArray *buttons = jsonData != nil ? [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil] : nil;
+        if (![buttons isKindOfClass:[NSArray class]]) {
+            return;
+        }
+        NSDictionary *target = nil;
+        for (NSDictionary *button in buttons) {
+            NSString *label = [button[@"label"] lowercaseString];
+            if ([label containsString:@"setting"] || [label containsString:@"subtitle"] || [label containsString:@"caption"] || [label containsString:@"server"]) {
+                target = button;
+                break;
+            }
+        }
+        if (target == nil) {
+            printf("[BCTRL] no settings/subtitles/servers button found\n");
+            fflush(stdout);
+            return;
+        }
+        printf("[BCTRL] pressing '%s' at %s,%s\n", [target[@"label"] UTF8String], [[target[@"x"] description] UTF8String], [[target[@"y"] description] UTF8String]);
+        fflush(stdout);
+        [self.pageActionCoordinator handlePageSelectionAtDOMPoint:CGPointMake([target[@"x"] doubleValue], [target[@"y"] doubleValue]) webView:self.webview];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            NSString *state = [self.webview stringByEvaluatingJavaScriptFromString:@"(function(){var v=document.querySelector('video'); var menus=[].filter.call(document.querySelectorAll('[role=menu],[role=dialog],[class*=menu],[class*=settings],[class*=panel]'),function(e){var r=e.getBoundingClientRect(); return r.width>40&&r.height>40&&getComputedStyle(e).visibility!=='hidden';}).length; return 'video paused='+(v&&v.paused)+' visibleMenus='+menus;})()"];
+            printf("[BCTRL] after press: presented=%s page: %s\n", self.presentedViewController ? NSStringFromClass(self.presentedViewController.class).UTF8String : "(none)", state.UTF8String);
+            fflush(stdout);
+        });
+    });
+}
+
 - (void)webViewDidFinishLoad:(id)webView {
     [self.tabCoordinator webViewDidFinishLoad:webView];
+    [self runNavigationDiagnosticsIfRequested:webView];
+    [self runPlayerControlsDiagnosticsIfRequested:webView];
     if (self.tabOverviewController.visible) {
         BrowserTabViewModel *tab = [self.tabCoordinator tabForWebView:webView];
         NSInteger tabIndex = tab != nil ? [self.viewModel.tabs indexOfObject:tab] : NSNotFound;
@@ -868,6 +1190,9 @@ static UIColor *kTextColor(void) {
     }
     if ([self.navigationService shouldIgnoreLoadError:error]) {
         return;
+    }
+    if ([[BrowserAdBlocker sharedBlocker] isBlockedURL:failingURL]) {
+        return; // blocked by the ad blocker on purpose
     }
 
     UIAlertController *alertController = [UIAlertController alertControllerWithTitle:@"Could Not Load Webpage"

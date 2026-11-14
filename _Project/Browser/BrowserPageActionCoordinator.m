@@ -164,7 +164,8 @@ static UIColor *BrowserPageActionTextColor(void) {
 }
 
 - (BOOL)handlePageSelectionAtDOMPoint:(CGPoint)point webView:(BrowserWebView *)webView {
-    if ([self.videoPlaybackCoordinator handleSelectPressForVideoAtCursor]) {
+    // Judge the point actually being selected (cursor or navigation highlight), not the cursor's position.
+    if ([self.videoPlaybackCoordinator handleSelectPressForVideoAtDOMPoint:point]) {
         return YES;
     }
     if ([self handleTargetBlankLinkAtDOMPoint:point webView:webView]) {

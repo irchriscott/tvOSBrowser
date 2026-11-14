@@ -237,6 +237,7 @@ static NSString *BrowserPressPhaseString(UIPressPhase phase) {
         [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(handleDeferredSelectPressAction) object:nil];
         if (![self.host browserRemoteInputControllerTabOverviewVisible]) {
             [self setCursorModeEnabled:!self.cursorModeEnabled];
+            [self.host browserRemoteInputControllerDidToggleCursorMode:self.cursorModeEnabled];
         }
         return;
     }
@@ -360,6 +361,17 @@ static NSString *BrowserPressPhaseString(UIPressPhase phase) {
     if (press.type == UIPressTypeSelect) {
         self.lastDirectSelectPressTimestamp = CACurrentMediaTime();
         [self handleSelectPressEnded];
+        return YES;
+    }
+
+    BOOL isArrowPress = press.type == UIPressTypeUpArrow || press.type == UIPressTypeDownArrow ||
+        press.type == UIPressTypeLeftArrow || press.type == UIPressTypeRightArrow;
+    if (isArrowPress && !self.cursorModeEnabled && presentedViewController == nil &&
+        ![self.host browserRemoteInputControllerTabOverviewVisible]) {
+        // Navigation mode: arrows move between links/buttons like a native tvOS app.
+        // (Up at the top of the page reaches the top bar via the host.)
+        [self stopManualScrollInertia];
+        [self.host browserRemoteInputControllerHandleNavigationPress:press.type];
         return YES;
     }
 

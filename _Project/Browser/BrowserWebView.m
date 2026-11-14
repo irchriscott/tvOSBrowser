@@ -4,6 +4,8 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 
+#import "BrowserAdBlocker.h"
+
 static NSString * const kBrowserWebViewClassName = @"WKWebView";
 static NSString * const kBrowserWebViewConfigurationClassName = @"WKWebViewConfiguration";
 static NSString * const kBrowserWebsiteDataStoreClassName = @"WKWebsiteDataStore";
@@ -655,6 +657,114 @@ static void BrowserInstallCrossOriginHLSUserScript(id configuration) {
     }
 }
 
+#pragma mark - Fullscreen API replacement
+
+static NSString * const kBrowserFullscreenMessageHandlerName = @"browserFullscreen";
+
+/// tvOS WebKit has no element fullscreen API (requestFullscreen & co. are missing)
+/// and its native video fullscreen shows a black screen. Provide the standard API
+/// by stretching the requested element over the whole page; the app hides its
+/// top bar meanwhile. Site player controls, subtitles and menus keep working.
+static NSString *BrowserFullscreenPolyfillScript(void) {
+    return @"(function(){"
+        "if (window.__browserFullscreenPolyfill) { return; }"
+        "if (typeof Element.prototype.requestFullscreen === 'function' || typeof Element.prototype.webkitRequestFullscreen === 'function') { return; }"
+        "window.__browserFullscreenPolyfill = true;"
+        "var current = null;"
+        "function notify(active) { try { window.webkit.messageHandlers.browserFullscreen.postMessage({ active: active }); } catch (e) {} }"
+        "function ensureStyle() {"
+            "if (document.getElementById('__browser-fullscreen-style')) { return; }"
+            "var style = document.createElement('style'); style.id = '__browser-fullscreen-style';"
+            "style.textContent = '[data-browser-fullscreen]{position:fixed!important;left:0!important;top:0!important;right:0!important;bottom:0!important;width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;z-index:2147483646!important;background:#000!important;transform:none!important;border-radius:0!important;}'"
+                "+ '[data-browser-fullscreen] video, video[data-browser-fullscreen]{width:100%!important;height:100%!important;max-height:none!important;object-fit:contain!important;}'"
+                "+ 'html.__browser-fullscreen, html.__browser-fullscreen body{overflow:hidden!important;}';"
+            "(document.head || document.documentElement).appendChild(style);"
+        "}"
+        "function fire(target, names) {"
+            "setTimeout(function() {"
+                "names.forEach(function(name) { try { target.dispatchEvent(new Event(name, { bubbles: true })); } catch (e) {} });"
+                "try { window.dispatchEvent(new Event('resize')); } catch (e) {}"
+            "}, 0);"
+        "}"
+        "function playerContainerFor(video) {"
+            "var vr = video.getBoundingClientRect(); var node = video.parentElement; var best = video;"
+            "for (var depth = 0; node && node !== document.body && depth < 4; depth++, node = node.parentElement) {"
+                "var r = node.getBoundingClientRect();"
+                "if (r.width * r.height > Math.max(1, vr.width * vr.height) * 1.6) { break; }"
+                "best = node;"
+            "}"
+            "return best;"
+        "}"
+        "function enter(element) {"
+            "if (!element || element === document) { element = document.documentElement; }"
+            "if (current === element) { return Promise.resolve(); }"
+            "if (current) { leave(true); }"
+            "ensureStyle();"
+            "current = element;"
+            "element.setAttribute('data-browser-fullscreen', '');"
+            "document.documentElement.classList.add('__browser-fullscreen');"
+            "notify(true);"
+            "fire(element, ['fullscreenchange', 'webkitfullscreenchange']);"
+            "return Promise.resolve();"
+        "}"
+        "function leave(silent) {"
+            "if (!current) { return Promise.resolve(); }"
+            "var element = current; current = null;"
+            "element.removeAttribute('data-browser-fullscreen');"
+            "document.documentElement.classList.remove('__browser-fullscreen');"
+            "notify(false);"
+            "if (!silent) { fire(element, ['fullscreenchange', 'webkitfullscreenchange']); }"
+            "return Promise.resolve();"
+        "}"
+        "Element.prototype.requestFullscreen = function() { return enter(this); };"
+        "Element.prototype.webkitRequestFullscreen = function() { enter(this); };"
+        "Element.prototype.webkitRequestFullScreen = Element.prototype.webkitRequestFullscreen;"
+        "Document.prototype.exitFullscreen = function() { return leave(false); };"
+        "Document.prototype.webkitExitFullscreen = function() { leave(false); };"
+        "Document.prototype.webkitCancelFullScreen = Document.prototype.webkitExitFullscreen;"
+        "function getter(proto, name, fn) { try { Object.defineProperty(proto, name, { configurable: true, get: fn }); } catch (e) {} }"
+        "['fullscreenElement', 'webkitFullscreenElement', 'webkitCurrentFullScreenElement'].forEach(function(name) { getter(Document.prototype, name, function() { return current; }); });"
+        "['fullscreenEnabled', 'webkitFullscreenEnabled', 'webkitFullScreenEnabled'].forEach(function(name) { getter(Document.prototype, name, function() { return true; }); });"
+        "['fullscreen', 'webkitIsFullScreen'].forEach(function(name) { getter(Document.prototype, name, function() { return !!current; }); });"
+        // iOS-style players call video.webkitEnterFullscreen(); on tvOS that is the black native path.
+        "HTMLVideoElement.prototype.webkitEnterFullscreen = function() {"
+            "var video = this; enter(playerContainerFor(video));"
+            "fire(video, ['webkitbeginfullscreen']);"
+        "};"
+        "HTMLVideoElement.prototype.webkitEnterFullScreen = HTMLVideoElement.prototype.webkitEnterFullscreen;"
+        "HTMLVideoElement.prototype.webkitExitFullscreen = function() { leave(false); fire(this, ['webkitendfullscreen']); };"
+        "HTMLVideoElement.prototype.webkitExitFullScreen = HTMLVideoElement.prototype.webkitExitFullscreen;"
+        "getter(HTMLVideoElement.prototype, 'webkitDisplayingFullscreen', function() { return !!current && (current === this || current.contains(this)); });"
+        "getter(HTMLVideoElement.prototype, 'webkitSupportsFullscreen', function() { return true; });"
+        "window.__browserExitFullscreen = function() { leave(false); };"
+        "new MutationObserver(function() { if (current && !document.contains(current)) { leave(false); } }).observe(document.documentElement, { childList: true, subtree: true });"
+    "})();";
+}
+
+/// WKUserContentController retains its message handlers; a weak proxy avoids a retain cycle.
+@interface BrowserScriptMessageProxy : NSObject
+@property (nonatomic, weak) id target;
+@end
+
+@implementation BrowserScriptMessageProxy
+
++ (void)initialize {
+    Protocol *handlerProtocol = objc_getProtocol("WKScriptMessageHandler");
+    if (handlerProtocol != NULL) {
+        class_addProtocol(self, handlerProtocol);
+    }
+}
+
+- (void)userContentController:(id)userContentController didReceiveScriptMessage:(id)message {
+    (void)userContentController;
+    SEL selector = NSSelectorFromString(@"handleScriptMessage:");
+    if ([self.target respondsToSelector:selector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(self.target, selector, message);
+    }
+}
+
+@end
+
 #pragma mark - Media diagnostics (launch with -BrowserMediaDiagnostics YES)
 
 static BOOL BrowserMediaDiagnosticsEnabled(void) {
@@ -699,6 +809,15 @@ static NSString *BrowserMediaDiagnosticsHookScript(void) {
                 "return p;"
             "};"
         "}"
+        "function describe(el) { return el ? (el.tagName + (el.id ? '#' + el.id : '') + '.' + String(el.className || '').slice(0, 40)) : 'null'; }"
+        "[['Element', 'requestFullscreen'], ['Element', 'webkitRequestFullscreen'], ['Element', 'webkitRequestFullScreen'], ['HTMLVideoElement', 'webkitEnterFullscreen'], ['HTMLVideoElement', 'webkitEnterFullScreen'], ['Document', 'exitFullscreen'], ['Document', 'webkitExitFullscreen'], ['Document', 'webkitCancelFullScreen']].forEach(function(pair) {"
+            "var proto = window[pair[0]] && window[pair[0]].prototype; var name = pair[1];"
+            "if (!proto || typeof proto[name] !== 'function') { log('fullscreen-api', pair[0] + '.' + name + ' MISSING'); return; }"
+            "var original = proto[name];"
+            "proto[name] = function() { log('fullscreen-call', pair[0] + '.' + name + ' on ' + describe(this)); try { var r = original.apply(this, arguments); if (r && r.then) { r.then(function() { log('fullscreen-call', name + ' resolved'); }, function(e) { log('fullscreen-call', name + ' rejected ' + e); }); } return r; } catch (e) { log('fullscreen-call', name + ' threw ' + e); throw e; } };"
+        "});"
+        "['fullscreenchange', 'webkitfullscreenchange', 'fullscreenerror', 'webkitfullscreenerror'].forEach(function(name) { document.addEventListener(name, function() { log('fullscreen-event', name + ' element=' + describe(document.fullscreenElement || document.webkitFullscreenElement)); }, true); });"
+        "['webkitbeginfullscreen', 'webkitendfullscreen', 'webkitpresentationmodechanged'].forEach(function(name) { document.addEventListener(name, function(e) { log('fullscreen-event', name + ' on ' + describe(e.target) + ' mode=' + (e.target && e.target.webkitPresentationMode)); }, true); });"
         "var origOpen = XMLHttpRequest.prototype.open;"
         "XMLHttpRequest.prototype.open = function(method, url) { this.__bdiagURL = String(url); this.__bdiagStart = Date.now(); return origOpen.apply(this, arguments); };"
         "var origSend = XMLHttpRequest.prototype.send;"
@@ -734,6 +853,16 @@ static NSString *BrowserMediaDiagnosticsCapabilityScript(void) {
                 "return WebAssembly.compile(b).then(function() { D.log && D.log('wasm-test', 'compiled in ' + (Date.now() - fetched) + 'ms'); });"
             "}).catch(function(e) { D.log && D.log('wasm-test', 'FAILED ' + e); });"
         "}"
+        "(function() {"
+            "function probe(label, src) { var s = document.createElement('script'); var t0 = Date.now(); s.src = src;"
+                "s.onload = function() { D.log && D.log('adblock-test', label + ' LOADED in ' + (Date.now() - t0) + 'ms'); };"
+                "s.onerror = function() { D.log && D.log('adblock-test', label + ' BLOCKED/failed in ' + (Date.now() - t0) + 'ms'); };"
+                "(document.head || document.documentElement).appendChild(s); }"
+            "probe('ad script (googlesyndication)', 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js');"
+            "probe('control script (cdnjs)', 'https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js');"
+            "var slot = document.createElement('div'); slot.setAttribute('data-ad-slot', '1'); slot.textContent = 'ad'; document.body.appendChild(slot);"
+            "setTimeout(function() { D.log && D.log('adblock-test', 'ad container display=' + getComputedStyle(slot).display); slot.remove(); }, 500);"
+        "})();"
         "out.cookiePrevious = (document.cookie.match(/__bdiag_c=([^;]*)/) || [])[1] || null;"
         "document.cookie = '__bdiag_c=' + Date.now() + '; max-age=31536000; path=/; secure; samesite=lax';"
         "try { out.localStoragePrevious = localStorage.getItem('__bdiag_ls'); localStorage.setItem('__bdiag_ls', new Date().toISOString()); out.localStorageWrite = 'ok'; } catch (e) { out.localStorageWrite = 'ERR ' + e; }"
@@ -838,6 +967,7 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
 @property (nonatomic, readwrite) double estimatedProgress;
 @property (nonatomic) BOOL observingProgress;
 @property (nonatomic) NSTimer *diagnosticsTimer;
+@property (nonatomic, weak) id userContentController;
 @property (nonatomic) NSUInteger diagnosticsTicks;
 
 @end
@@ -890,6 +1020,26 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
     BrowserConfigurePrivateMediaPreferences(configuration);
     BrowserInstallYouTubeCaptureUserScript(configuration);
     BrowserInstallCrossOriginHLSUserScript(configuration);
+    SEL userContentControllerGetter = NSSelectorFromString(@"userContentController");
+    if ([configuration respondsToSelector:userContentControllerGetter]) {
+        id userContentController = ((id (*)(id, SEL))objc_msgSend)(configuration, userContentControllerGetter);
+        self.userContentController = userContentController;
+        [[BrowserAdBlocker sharedBlocker] attachToUserContentController:userContentController];
+
+        Class userScriptClass = NSClassFromString(kBrowserUserScriptClassName);
+        SEL userScriptInitializer = NSSelectorFromString(@"initWithSource:injectionTime:forMainFrameOnly:");
+        if (userScriptClass != Nil && [userScriptClass instancesRespondToSelector:userScriptInitializer]) {
+            id userScript = ((id (*)(id, SEL))objc_msgSend)((id)userScriptClass, @selector(alloc));
+            userScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(userScript, userScriptInitializer, BrowserFullscreenPolyfillScript(), 0, YES);
+            ((void (*)(id, SEL, id))objc_msgSend)(userContentController, NSSelectorFromString(@"addUserScript:"), userScript);
+        }
+        SEL addHandlerSelector = NSSelectorFromString(@"addScriptMessageHandler:name:");
+        if ([userContentController respondsToSelector:addHandlerSelector]) {
+            BrowserScriptMessageProxy *proxy = [BrowserScriptMessageProxy new];
+            proxy.target = self;
+            ((void (*)(id, SEL, id, id))objc_msgSend)(userContentController, addHandlerSelector, proxy, kBrowserFullscreenMessageHandlerName);
+        }
+    }
     BrowserInstallMediaDiagnosticsUserScript(configuration);
 
     id webViewObject = ((id (*)(id, SEL))objc_msgSend)((id)webViewClass, @selector(alloc));
@@ -924,7 +1074,22 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
     self.observingProgress = YES;
 }
 
+- (void)handleScriptMessage:(id)message {
+    NSString *name = [message respondsToSelector:@selector(name)] ? [message valueForKey:@"name"] : nil;
+    id body = [message respondsToSelector:NSSelectorFromString(@"body")] ? [message valueForKey:@"body"] : nil;
+    if ([name isEqualToString:kBrowserFullscreenMessageHandlerName] && [body isKindOfClass:[NSDictionary class]]) {
+        BOOL active = [body[@"active"] boolValue];
+        if ([self.delegate respondsToSelector:@selector(webView:didChangePageFullscreen:)]) {
+            [self.delegate webView:self didChangePageFullscreen:active];
+        }
+    }
+}
+
 - (void)dealloc {
+    SEL removeHandlerSelector = NSSelectorFromString(@"removeScriptMessageHandlerForName:");
+    if ([self.userContentController respondsToSelector:removeHandlerSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(self.userContentController, removeHandlerSelector, kBrowserFullscreenMessageHandlerName);
+    }
     if (self.observingProgress) {
         for (NSString *keyPath in @[@"estimatedProgress", @"loading"]) {
             [self.runtimeWebView removeObserver:self forKeyPath:keyPath context:BrowserWebViewProgressObservationContext];
@@ -1075,6 +1240,21 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
         return nil;
     }
     return BrowserStringFromJavaScriptResult(evaluationResult);
+}
+
+- (void)evaluateJavaScript:(NSString *)script completionHandler:(void (^)(id, NSError *))completionHandler {
+    SEL selector = NSSelectorFromString(@"evaluateJavaScript:completionHandler:");
+    if (script.length == 0 || ![self.runtimeWebView respondsToSelector:selector]) {
+        if (completionHandler != nil) {
+            completionHandler(nil, nil);
+        }
+        return;
+    }
+    ((void (*)(id, SEL, id, id))objc_msgSend)(self.runtimeWebView, selector, script, ^(id result, NSError *error) {
+        if (completionHandler != nil) {
+            completionHandler(result, error);
+        }
+    });
 }
 
 - (void)pauseAllMediaPlayback {

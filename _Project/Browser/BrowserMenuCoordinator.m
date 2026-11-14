@@ -1,4 +1,6 @@
 #import "BrowserMenuCoordinator.h"
+
+#import "BrowserAdBlocker.h"
 #import "BrowserPreferencesStore.h"
 #import "BrowserWebView.h"
 
@@ -1000,6 +1002,21 @@ withAnimationCoordinator:(UIFocusAnimationCoordinator *)coordinator {
     }];
 }
 
+- (BrowserAdvancedMenuItem *)adBlockerToggleMenuItem {
+    BrowserAdBlocker *blocker = [BrowserAdBlocker sharedBlocker];
+    BOOL enabled = blocker.enabled;
+    return [self advancedMenuItemWithTitle:enabled ? @"Turn Off Ad Blocker" : @"Turn On Ad Blocker"
+                                     style:enabled ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault
+                                   handler:^{
+        blocker.enabled = !enabled;
+        // Reload so the change applies to the page on screen.
+        BrowserWebView *webView = [self.host browserWebView];
+        if (webView.request.URL != nil && !webView.hidden) {
+            [webView reload];
+        }
+    }];
+}
+
 - (BrowserAdvancedMenuItem *)fullscreenVideoPlaybackToggleMenuItem {
     BOOL enabled = self.host.browserFullscreenVideoPlaybackEnabled;
     NSString *title = enabled ? @"Disable Full Screen player" : @"Enable Full Screen player";
@@ -1070,6 +1087,10 @@ withAnimationCoordinator:(UIFocusAnimationCoordinator *)coordinator {
         [BrowserAdvancedMenuSection sectionWithTitle:@"Video Playback"
                                                items:@[
             [self fullscreenVideoPlaybackToggleMenuItem],
+        ]],
+        [BrowserAdvancedMenuSection sectionWithTitle:@"Privacy"
+                                               items:@[
+            [self adBlockerToggleMenuItem],
         ]],
         [BrowserAdvancedMenuSection sectionWithTitle:@"Compatibility"
                                                items:@[

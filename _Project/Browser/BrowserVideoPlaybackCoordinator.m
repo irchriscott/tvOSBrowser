@@ -78,15 +78,18 @@ static BOOL const kBrowserYouTubeNativeExtractionEnabled = NO;
 
     NSURL *videoURL = [NSURL URLWithString:videoURLString];
     NSString *title = [videoInfo[@"title"] isKindOfClass:[NSString class]] ? videoInfo[@"title"] : self.host.browserCurrentPageTitle;
-    [self presentNativeVideoPlayerForURL:videoURL title:title];
+    [self presentNativeVideoPlayerForURL:videoURL title:title startTime:[videoInfo[@"currentTime"] doubleValue]];
 }
 
 - (BOOL)handleSelectPressForVideoAtCursor {
+    return [self handleSelectPressForVideoAtDOMPoint:self.host.browserDOMCursorPoint];
+}
+
+- (BOOL)handleSelectPressForVideoAtDOMPoint:(CGPoint)point {
     if (![self isFullscreenVideoPlaybackEnabled]) {
         return NO;
     }
 
-    CGPoint point = self.host.browserDOMCursorPoint;
     if ([self.domInteractionService isVideoDismissTargetAtDOMPoint:point webView:self.host.browserWebView]) {
         return NO;
     }
@@ -97,7 +100,7 @@ static BOOL const kBrowserYouTubeNativeExtractionEnabled = NO;
     if ([self isNativePlayableVideoURLString:directVideoURLString]) {
         NSURL *videoURL = [NSURL URLWithString:directVideoURLString];
         NSString *title = [directVideoInfo[@"title"] isKindOfClass:[NSString class]] ? directVideoInfo[@"title"] : self.host.browserCurrentPageTitle;
-        [self presentNativeVideoPlayerForURL:videoURL title:title];
+        [self presentNativeVideoPlayerForURL:videoURL title:title startTime:[directVideoInfo[@"currentTime"] doubleValue]];
         return YES;
     }
 
@@ -124,7 +127,7 @@ static BOOL const kBrowserYouTubeNativeExtractionEnabled = NO;
     if ([self isNativePlayableVideoURLString:videoURLString]) {
         NSURL *videoURL = [NSURL URLWithString:videoURLString];
         NSString *title = [videoInfo[@"title"] isKindOfClass:[NSString class]] ? videoInfo[@"title"] : self.host.browserCurrentPageTitle;
-        [self presentNativeVideoPlayerForURL:videoURL title:title];
+        [self presentNativeVideoPlayerForURL:videoURL title:title startTime:[videoInfo[@"currentTime"] doubleValue]];
     } else {
         // The activation step above already clicked the target, so the page handles it
         // (e.g. an hls.js player that only exposes a blob: URL, or a Play button that
@@ -177,11 +180,35 @@ static BOOL const kBrowserYouTubeNativeExtractionEnabled = NO;
 }
 
 - (void)presentNativeVideoPlayerForURL:(NSURL *)URL title:(NSString *)title {
+    [self presentNativeVideoPlayerForURL:URL title:title startTime:0.0];
+}
+
+- (void)presentNativeVideoPlayerForURL:(NSURL *)URL title:(NSString *)title startTime:(NSTimeInterval)startTime {
+    if (![self isFullscreenVideoPlaybackEnabled] || URL == nil) {
+        return;
+    }
     // Send what the page itself would: many HLS hosts reject requests without the
     // page's Origin/Referer (e.g. 404 for the master playlist and every segment).
-    NSURL *pageURL = self.host.browserWebView.request.URL;
+    BrowserWebView *webView = self.host.browserWebView;
+    NSURL *pageURL = webView.request.URL;
     NSDictionary<NSString *, NSString *> *headers = [self browserHeadersForPlaybackURL:URL pageURL:pageURL];
-    [self presentNativeVideoPlayerForURL:URL title:title requestHeaders:headers cookies:nil];
+    [webView pauseAllMediaPlayback];
+
+    BrowserNativeVideoPlayerViewController *playerViewController = [[BrowserNativeVideoPlayerViewController alloc] initWithURL:URL
+                                                                                                                          title:title
+                                                                                                                  requestHeaders:headers
+                                                                                                                         cookies:nil];
+    playerViewController.startTime = startTime;
+    __weak BrowserWebView *weakWebView = webView;
+    NSString *sourceURLString = URL.absoluteString ?: @"";
+    playerViewController.dismissHandler = ^(NSTimeInterval currentTime) {
+        // Continue in the page from where the full screen player stopped.
+        NSData *data = [NSJSONSerialization dataWithJSONObject:@[sourceURLString] options:0 error:nil];
+        NSString *array = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        NSString *script = [NSString stringWithFormat:@"(function(src, t){var videos=document.querySelectorAll('video'); for(var i=0;i<videos.length;i++){var v=videos[i]; if((v.currentSrc||v.src)===src){try{v.currentTime=t;}catch(e){} return 'synced';}} return 'no match';})(%@[0], %f)", array, currentTime];
+        [weakWebView evaluateJavaScript:script completionHandler:nil];
+    };
+    [self.host browserPresentViewController:playerViewController];
 }
 
 - (void)presentNativeVideoPlayerForURL:(NSURL *)URL

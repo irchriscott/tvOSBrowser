@@ -23,6 +23,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (NSString *)browserRemoteInputControllerHoverStateAtCursorPoint:(CGPoint)point;
 - (void)browserRemoteInputControllerSetWebInteractionEnabled:(BOOL)enabled;
 - (void)browserRemoteInputControllerPersistSession;
+/// Scroll (navigation) mode: an arrow press on the remote should move the page highlight.
+- (void)browserRemoteInputControllerHandleNavigationPress:(UIPressType)pressType;
+/// The user switched between cursor and navigation mode with a double press.
+- (void)browserRemoteInputControllerDidToggleCursorMode:(BOOL)cursorModeEnabled;
 
 @end
 

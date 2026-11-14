@@ -43,6 +43,7 @@ static NSTimeInterval const kRepeatedCrashInterval = 30.0;
 @property (nonatomic) NSMutableSet<NSString *> *crashOverlayTabIdentifiers;
 @property (nonatomic) NSMutableDictionary<NSString *, NSDate *> *lastCrashDates;
 @property (nonatomic) UIView *crashOverlayView;
+@property (nonatomic, readwrite) BOOL pageFullscreenActive;
 
 @end
 
@@ -295,7 +296,9 @@ static NSTimeInterval const kRepeatedCrashInterval = 30.0;
     if (self.activeWebView == nil) {
         return;
     }
-    if (self.topNavigationVisible) {
+    if (self.pageFullscreenActive) {
+        self.activeWebView.frame = self.rootView.bounds;
+    } else if (self.topNavigationVisible) {
         self.activeWebView.frame = CGRectMake(self.rootView.bounds.origin.x,
                                               self.rootView.bounds.origin.y + self.topMenuBrowserOffset,
                                               self.rootView.bounds.size.width,
@@ -410,6 +413,21 @@ static NSTimeInterval const kRepeatedCrashInterval = 30.0;
     webView.contentMode = shouldScalePagesToFit ? UIViewContentModeScaleAspectFit : UIViewContentModeScaleToFill;
     webView.userInteractionEnabled = NO;
     return webView;
+}
+
+#pragma mark - Page fullscreen
+
+- (void)setPageFullscreen:(BOOL)fullscreen forWebView:(id)webView {
+    if (webView != nil && webView != self.activeWebView) {
+        return;
+    }
+    if (self.pageFullscreenActive == fullscreen) {
+        return;
+    }
+    self.pageFullscreenActive = fullscreen;
+    self.topMenuView.hidden = fullscreen || !self.topNavigationVisible;
+    [self updateTopNavAndWebView];
+    [self updateLoadIndicatorsAnimated:NO];
 }
 
 #pragma mark - Page process crashes
@@ -731,6 +749,7 @@ static NSTimeInterval const kRepeatedCrashInterval = 30.0;
         [self parkWebViewForThumbnailing:candidateWebView];
     }
 
+    [self setPageFullscreen:NO forWebView:nil];
     self.activeWebView = activeWebView;
     [self.activeWebView removeFromSuperview];
     [self.browserContainerView addSubview:self.activeWebView];
@@ -1051,6 +1070,10 @@ static NSTimeInterval const kRepeatedCrashInterval = 30.0;
         return;
     }
     NSString *requestURL = request.URL.absoluteString ?: @"";
+    if (tab == self.activeTab && self.pageFullscreenActive) {
+        // A new page never inherits the previous page's fullscreen state.
+        [self setPageFullscreen:NO forWebView:nil];
+    }
     if (tab.URLString.length > 0 && ![tab.URLString isEqualToString:requestURL]) {
         tab.savedScrollOffset = CGPointZero;
         tab.hasSavedScrollOffset = NO;

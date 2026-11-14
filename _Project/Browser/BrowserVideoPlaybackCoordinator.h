@@ -25,6 +25,11 @@ NS_ASSUME_NONNULL_BEGIN
        domInteractionService:(BrowserDOMInteractionService *)domInteractionService;
 - (void)playVideoUnderCursorIfAvailable;
 - (BOOL)handleSelectPressForVideoAtCursor;
+/// Same, for an explicit page point (CSS px) - e.g. the element highlighted in navigation mode.
+- (BOOL)handleSelectPressForVideoAtDOMPoint:(CGPoint)point;
+/// Opens the native full screen player for a page video (from its current position)
+/// and syncs the position back to the page video when the player closes.
+- (void)presentNativeVideoPlayerForURL:(NSURL *)URL title:(nullable NSString *)title startTime:(NSTimeInterval)startTime;
 
 @end
 

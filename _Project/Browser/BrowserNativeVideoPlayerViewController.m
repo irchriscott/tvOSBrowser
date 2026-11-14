@@ -5,6 +5,24 @@
 
 static NSString * const kBrowserNativeVideoPlayerLogPrefix = @"[NativeVideoPlayer]";
 static NSString * const kBrowserNativePlayerInputLogPrefix = @"[InputTrace][NativePlayer]";
+static NSString * const kBrowserNativePlayerQualityDefaultsKey = @"NativePlayerPreferredQuality";
+
+typedef struct {
+    __unsafe_unretained NSString *identifier;
+    __unsafe_unretained NSString *title;
+    CGFloat width;
+    CGFloat height;
+} BrowserNativePlayerQuality;
+
+/// Width/height 0 = no cap (Auto). The cap is a ceiling: AVPlayer still adapts
+/// below it when bandwidth or the TV's display mode cannot sustain it.
+static const BrowserNativePlayerQuality kBrowserNativePlayerQualities[] = {
+    { @"auto", @"Auto", 0, 0 },
+    { @"2160", @"4K (2160p)", 3840, 2160 },
+    { @"1080", @"1080p", 1920, 1080 },
+    { @"720", @"720p", 1280, 720 },
+    { @"480", @"480p", 854, 480 },
+};
 
 static NSString *BrowserNativePlayerPressTypeString(UIPressType type) {
     switch (type) {
@@ -37,6 +55,8 @@ static NSString *BrowserNativePlayerPressPhaseString(UIPressPhase phase) {
 @property (nonatomic, copy) NSDictionary<NSString *, NSString *> *requestHeaders;
 @property (nonatomic, copy) NSArray<NSHTTPCookie *> *requestCookies;
 @property (nonatomic, strong) BrowserNativeVideoAssetLoader *assetLoader;
+@property (nonatomic) BOOL didApplyStartTime;
+@property (nonatomic) BOOL didReportDismissal;
 
 @end
 
@@ -74,6 +94,12 @@ static NSString *BrowserNativePlayerPressPhaseString(UIPressPhase phase) {
 
     self.view.backgroundColor = UIColor.blackColor;
     self.showsPlaybackControls = YES;
+    if (@available(tvOS 11.2, *)) {
+        // Let tvOS switch the TV to the video's frame rate / dynamic range (needs Settings >
+        // Video and Audio > Match Content). 4K streams are often HDR-only, and HDR variants are
+        // only chosen when the TV is in an HDR mode.
+        self.appliesPreferredDisplayCriteriaAutomatically = YES;
+    }
     AVPlayerItem *playerItem = nil;
     if (self.requestHeaders.count > 0 || self.requestCookies.count > 0) {
         NSMutableDictionary *assetOptions = [NSMutableDictionary dictionary];
@@ -87,17 +113,27 @@ static NSString *BrowserNativePlayerPressPhaseString(UIPressPhase phase) {
         if (self.requestCookies.count > 0) {
             assetOptions[@"AVURLAssetHTTPCookiesKey"] = self.requestCookies;
         }
-        self.assetLoader = [[BrowserNativeVideoAssetLoader alloc] initWithRequestHeaders:self.requestHeaders cookies:self.requestCookies];
-        NSURL *assetURL = [self.assetLoader assetURLForPlaybackURL:self.videoURL];
-        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:assetURL options:assetOptions];
-        [self.assetLoader attachToAsset:asset];
+        AVURLAsset *asset = nil;
+        if ([self isHLSURL:self.videoURL]) {
+            // AVFoundation applies these headers to every playlist and segment request itself.
+            // The custom resource loader cannot serve HLS media segments (CoreMedia -12881:
+            // black screen), so HLS must not go through it.
+            asset = [AVURLAsset URLAssetWithURL:self.videoURL options:assetOptions];
+        } else {
+            self.assetLoader = [[BrowserNativeVideoAssetLoader alloc] initWithRequestHeaders:self.requestHeaders cookies:self.requestCookies];
+            NSURL *assetURL = [self.assetLoader assetURLForPlaybackURL:self.videoURL];
+            asset = [AVURLAsset URLAssetWithURL:assetURL options:assetOptions];
+            [self.assetLoader attachToAsset:asset];
+        }
         playerItem = [AVPlayerItem playerItemWithAsset:asset];
         [self log:@"using request headers %@ cookies=%lu", self.requestHeaders, (unsigned long)self.requestCookies.count];
     } else {
         playerItem = [AVPlayerItem playerItemWithURL:self.videoURL];
     }
     self.player = [AVPlayer playerWithPlayerItem:playerItem];
-    [self log:@"created player url=%@", self.videoURL.absoluteString ?: @""];
+    [self applyQuality:[self savedQualityIndex]];
+    [self rebuildQualityMenu];
+    [self log:@"created player url=%@ start=%.1f", self.videoURL.absoluteString ?: @"", self.startTime];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(handlePlayerItemFailedToPlayToEndTime:)
@@ -122,6 +158,78 @@ static NSString *BrowserNativePlayerPressPhaseString(UIPressPhase phase) {
     NSLog(@"%@ viewDidAppear", kBrowserNativePlayerInputLogPrefix);
     [self log:@"viewDidAppear play"];
     [self.player play];
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    if ((self.isBeingDismissed || self.presentingViewController == nil) && !self.didReportDismissal) {
+        self.didReportDismissal = YES;
+        NSTimeInterval currentTime = CMTimeGetSeconds(self.player.currentTime);
+        if (self.dismissHandler != nil && isfinite(currentTime)) {
+            self.dismissHandler(currentTime);
+        }
+    }
+}
+
+#pragma mark - HLS & quality
+
+- (BOOL)isHLSURL:(NSURL *)URL {
+    NSString *path = URL.path.lowercaseString ?: @"";
+    NSString *query = URL.query.lowercaseString ?: @"";
+    return [path hasSuffix:@".m3u8"] || [query containsString:@"m3u8"];
+}
+
+- (NSUInteger)savedQualityIndex {
+    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:kBrowserNativePlayerQualityDefaultsKey] ?: @"auto";
+    NSUInteger count = sizeof(kBrowserNativePlayerQualities) / sizeof(kBrowserNativePlayerQualities[0]);
+    for (NSUInteger index = 0; index < count; index++) {
+        if ([kBrowserNativePlayerQualities[index].identifier isEqualToString:saved]) {
+            return index;
+        }
+    }
+    return 0;
+}
+
+- (void)applyQuality:(NSUInteger)index {
+    BrowserNativePlayerQuality quality = kBrowserNativePlayerQualities[index];
+    AVPlayerItem *item = self.player.currentItem;
+    if (@available(tvOS 11.0, *)) {
+        item.preferredMaximumResolution = CGSizeMake(quality.width, quality.height);
+    }
+    item.preferredPeakBitRate = 0; // resolution is the only cap; bandwidth adaption stays automatic
+    [self log:@"quality=%@ maxResolution=%.0fx%.0f", quality.identifier, quality.width, quality.height];
+}
+
+- (void)selectQuality:(NSUInteger)index {
+    [[NSUserDefaults standardUserDefaults] setObject:kBrowserNativePlayerQualities[index].identifier forKey:kBrowserNativePlayerQualityDefaultsKey];
+    [self applyQuality:index];
+    [self rebuildQualityMenu];
+}
+
+/// "Quality" in the player's transport bar (swipe down while playing).
+- (void)rebuildQualityMenu {
+    if (@available(tvOS 15.0, *)) {
+        NSUInteger selected = [self savedQualityIndex];
+        NSUInteger count = sizeof(kBrowserNativePlayerQualities) / sizeof(kBrowserNativePlayerQualities[0]);
+        NSMutableArray<UIAction *> *actions = [NSMutableArray array];
+        __weak typeof(self) weakSelf = self;
+        for (NSUInteger index = 0; index < count; index++) {
+            UIAction *action = [UIAction actionWithTitle:kBrowserNativePlayerQualities[index].title
+                                                   image:nil
+                                              identifier:nil
+                                                 handler:^(__unused UIAction *sender) {
+                [weakSelf selectQuality:index];
+            }];
+            action.state = index == selected ? UIMenuElementStateOn : UIMenuElementStateOff;
+            [actions addObject:action];
+        }
+        UIMenu *menu = [UIMenu menuWithTitle:@"Quality"
+                                       image:[UIImage systemImageNamed:@"slider.horizontal.3"]
+                                  identifier:nil
+                                     options:UIMenuOptionsSingleSelection
+                                    children:actions];
+        self.transportBarCustomMenuItems = @[menu];
+    }
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -211,10 +319,18 @@ static NSString *BrowserNativePlayerPressPhaseString(UIPressPhase phase) {
                 [self log:@"item status=unknown error=%@", self.player.currentItem.error];
                 break;
             case AVPlayerItemStatusReadyToPlay:
-                [self log:@"item status=ready duration=%f likelyToKeepUp=%d bufferEmpty=%d",
+                [self log:@"item status=ready duration=%f likelyToKeepUp=%d bufferEmpty=%d presentationSize=%@",
                  CMTimeGetSeconds(self.player.currentItem.duration),
                  self.player.currentItem.isPlaybackLikelyToKeepUp,
-                 self.player.currentItem.isPlaybackBufferEmpty];
+                 self.player.currentItem.isPlaybackBufferEmpty,
+                 NSStringFromCGSize(self.player.currentItem.presentationSize)];
+                if (!self.didApplyStartTime && self.startTime > 1.0) {
+                    self.didApplyStartTime = YES;
+                    [self.player seekToTime:CMTimeMakeWithSeconds(self.startTime, NSEC_PER_SEC)
+                            toleranceBefore:kCMTimeZero
+                             toleranceAfter:kCMTimeZero
+                          completionHandler:^(__unused BOOL finished) {}];
+                }
                 break;
             case AVPlayerItemStatusFailed:
                 [self log:@"item status=failed error=%@", self.player.currentItem.error];

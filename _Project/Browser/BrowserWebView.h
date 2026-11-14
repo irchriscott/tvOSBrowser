@@ -14,6 +14,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)webView:(id _Nonnull)webView didChangeLoadProgress:(double)progress loading:(BOOL)loading;
 /// WebKit's page process died (crash or killed for memory). The view shows nothing until reloaded.
 - (void)webViewContentProcessDidTerminate:(id _Nonnull)webView;
+/// The page entered/left fullscreen (tvOS WebKit has no fullscreen API; the app emulates it).
+- (void)webView:(id _Nonnull)webView didChangePageFullscreen:(BOOL)fullscreen;
 
 @end
 
@@ -38,6 +40,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)goBack;
 - (void)goForward;
 - (nullable NSString *)stringByEvaluatingJavaScriptFromString:(NSString * _Nonnull)script;
+/// Asynchronous evaluation (no run-loop pumping); safe to call from event handlers.
+- (void)evaluateJavaScript:(NSString * _Nonnull)script completionHandler:(void (^ _Nullable)(id _Nullable result, NSError * _Nullable error))completionHandler;
 - (NSString * _Nonnull)runtimeMediaPreferenceReport;
 - (void)setUserAgent:(NSString * _Nullable)userAgent;
 - (void)pauseAllMediaPlayback;
