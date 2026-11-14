@@ -155,9 +155,11 @@ static NSString * const kEditableElementSelector = @"input, textarea, select, [c
         return @"false";
     }
 
+    // Over a player embedded from another site, move the "mouse" inside that frame instead.
+    NSString *frameHover = [NSString stringWithFormat:@"if (resolvedElement && resolvedElement.tagName === 'IFRAME' && window.__browserFrameBridge && window.__browserFrameBridge.send('%@', resolvedElement, 'hover', x, y)) { return 'false'; }", [BrowserWebView frameBridgeToken]];
     return [self evaluateResolvedElementJavaScriptAtPoint:point
                                                   webView:webView
-                                                     body:@"function browserMouseEvent(target, type, related) {"
+                                                     body:[frameHover stringByAppendingString:@"function browserMouseEvent(target, type, related) {"
                                                               "if (!target) { return; }"
                                                               "var init = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y, relatedTarget: related || null, pointerType: 'mouse', isPrimary: true };"
                                                               "try { target.dispatchEvent(type.indexOf('pointer') === 0 && window.PointerEvent ? new PointerEvent(type, init) : new MouseEvent(type, init)); } catch (e) {}"
@@ -175,7 +177,7 @@ static NSString * const kEditableElementSelector = @"input, textarea, select, [c
                                                               "if (candidate.matches && candidate.matches(interactiveSelector)) { return 'true'; }"
                                                               "candidate = candidate.parentElement;"
                                                           "}"
-                                                          "return 'false';"];
+                                                          "return 'false';"]];
 }
 
 - (NSString *)javaScriptEscapedString:(NSString *)string {

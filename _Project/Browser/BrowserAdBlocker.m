@@ -6,7 +6,7 @@ NSNotificationName const BrowserAdBlockerDidBlockPopupNotification = @"BrowserAd
 
 static NSString * const kAdBlockerEnabledDefaultsKey = @"AdBlockerEnabled";
 /// Bump when the rules change so the compiled list is rebuilt.
-static NSString * const kAdBlockerRuleListIdentifier = @"BrowserAdBlocker-v2";
+static NSString * const kAdBlockerRuleListIdentifier = @"BrowserAdBlocker-v4";
 
 /// Throwaway domain endings used by rotating ad/pop-under networks (they register new random
 /// names daily, so they cannot be listed by name). Only third-party *scripts* on these endings
@@ -20,6 +20,12 @@ static NSArray<NSString *> *BrowserAdBlockerSuspiciousTLDs(void) {
 static NSArray<NSString *> *BrowserAdBlockerPathFilters(void) {
     return @[
         @"^[^:]+://+www\\.vidy\\.st/scripts/",   // movy.sx pop-under / ad loader (users.vidy.st stays allowed)
+        // Pop-under / "social bar" network on rotating domains, recognisable by its script path
+        // (/87/48/bc/<long hex>.js): it injected a full-screen ad layer over sports streams.
+        // (WebKit content rules have no {n} counts, so the hex pairs are spelled out.)
+        @"^[^:]+://+[^/]+/[0-9a-f][0-9a-f]/[0-9a-f][0-9a-f]/[0-9a-f][0-9a-f]/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]+\\.js",
+        @"^[^:]+://+[^/]+/sbar\\.json\\?key=",
+        @"^[^:]+://+[^/]+/sb/notifications/",
     ];
 }
 
@@ -54,6 +60,11 @@ static NSArray<NSString *> *BrowserAdBlockerHosts(void) {
         // Seen on movy.sx (in-page push / fake alert networks)
         @"doomsarchaic.com", @"k1nm7c66rh4fgh.cfd", @"smockeddesmoid.qpon", @"sciageuncorks.cyou",
         @"gallaupcoil.cfd",
+        // Seen on sports streaming sites (hesgoal, gkstreams): pop-under, in-page push and ad layers
+        @"interfereernieinward.com", @"reliedhounder.com", @"variacgaia.click", @"luugy.com",
+        @"rtmark.net", @"llvpn.com", @"realizationnewestfangs.com", @"show-sb.com", @"cloudpiko.com",
+        @"adexchangeclear.com", @"thatdisform.cyou", @"histats.com",
+        @"budgetezy.org", @"capitalhospitals.org",   // click-hijack link laid over embedded players
         // Trackers
         @"scorecardresearch.com", @"quantserve.com", @"hotjar.com", @"mouseflow.com",
         @"crazyegg.com", @"chartbeat.com", @"newrelic.com", @"nr-data.net", @"bluekai.com",
@@ -100,6 +111,17 @@ static NSString *BrowserAdBlockerRuleListJSON(void) {
     [rules addObject:@{
         @"trigger": @{ @"url-filter": @".*" },
         @"action": @{ @"type": @"css-display-none", @"selector": BrowserAdBlockerCosmeticSelector() },
+    }];
+    // Links to ad hosts laid over a player (click hijacking: the first click on the video opened an
+    // ad tab instead of reaching the player). Hidden in every frame.
+    NSMutableArray<NSString *> *adLinks = [NSMutableArray array];
+    for (NSString *host in BrowserAdBlockerHosts()) {
+        [adLinks addObject:[NSString stringWithFormat:@"a[href*='://%@/']", host]];
+        [adLinks addObject:[NSString stringWithFormat:@"a[href*='.%@/']", host]];
+    }
+    [rules addObject:@{
+        @"trigger": @{ @"url-filter": @".*" },
+        @"action": @{ @"type": @"css-display-none", @"selector": [adLinks componentsJoinedByString:@", "] },
     }];
     NSData *data = [NSJSONSerialization dataWithJSONObject:rules options:0 error:nil];
     return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"[]";

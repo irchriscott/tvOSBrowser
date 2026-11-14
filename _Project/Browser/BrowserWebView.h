@@ -55,6 +55,9 @@ NS_ASSUME_NONNULL_BEGIN
 + (void)clearCachedDataWithCompletion:(void (^ _Nullable)(void))completion;
 + (void)clearCookiesWithCompletion:(void (^ _Nullable)(void))completion;
 + (void)resetWebsiteDataWithCompletion:(void (^ _Nullable)(void))completion;
+/// Key for the in-page frame bridge (window.__browserFrameBridge), which passes the app's clicks,
+/// hovers and Play/Pause into players embedded in iframes. Pass it as the bridge calls' first argument.
++ (NSString * _Nonnull)frameBridgeToken;
 
 @end
 

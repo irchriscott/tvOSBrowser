@@ -248,8 +248,9 @@ static UIColor *kTextColor(void) {
         [self showToast:@"Click the edges of the remote's touch surface to pick a link"];
         return;
     }
-    if ([outcome isEqualToString:@"text"]) {
-        // Text fields get the on-screen keyboard prompt, which works from a page point.
+    if ([outcome isEqualToString:@"text"] || [outcome isEqualToString:@"frame"]) {
+        // Text fields get the on-screen keyboard prompt, which works from a page point; an embedded
+        // player (iframe) gets the click handed to its frame at that point.
         NSValue *point = [self.pageNavigator activationPointInWebView:self.webview];
         if (point != nil) {
             [self.pageActionCoordinator handlePageSelectionAtDOMPoint:point.CGPointValue webView:self.webview];
@@ -968,8 +969,16 @@ static UIColor *kTextColor(void) {
 
 - (BOOL)webView:(id)webView shouldCreateNewTabWithRequest:(NSURLRequest *)request navigationType:(NSInteger)navigationType {
     NSURL *sourceURL = [webView request].URL;
+    NSLog(@"[Browser] new window request %@ navigationType=%ld from %@", request.URL.absoluteString, (long)navigationType, sourceURL.host);
     if ([[BrowserAdBlocker sharedBlocker] shouldBlockPopupRequest:request navigationType:navigationType sourceURL:sourceURL]) {
         return YES; // handled: the pop-up is dropped
+    }
+    if (self.viewModel.tabs.count >= [BrowserViewModel maximumTabCount]) {
+        // All tabs are in use: open the link here rather than refusing it (links such as a
+        // sports site's "Watch" buttons open in a new window and would otherwise do nothing).
+        [self showToast:@"Tab limit reached · opened here"];
+        [webView loadRequest:request];
+        return YES;
     }
     return [self.tabCoordinator createNewTabWithRequest:request];
 }
@@ -1502,8 +1511,81 @@ static UIColor *kTextColor(void) {
     }
 }
 
+- (void)runClickDiagnosticsIfRequested {
+    // Launch with -BrowserClickSelector '<css selector>': presses that element on the first page
+    // (as the navigation highlight's Select does) and reports the tabs/pages that result.
+    static BOOL ranOnce = NO;
+    NSString *selector = [[NSUserDefaults standardUserDefaults] stringForKey:@"BrowserClickSelector"];
+    if (ranOnce || selector.length == 0) {
+        return;
+    }
+    ranOnce = YES;
+    void (^report)(NSString *) = ^(NSString *label) {
+        printf("[BCLICK] %s: tabs=%lu active=%ld url=%s\n", label.UTF8String, (unsigned long)self.viewModel.tabs.count,
+               (long)self.viewModel.activeTabIndex, self.webview.request.URL.absoluteString.UTF8String ?: "(none)");
+        fflush(stdout);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        report(@"before click");
+        NSData *json = [NSJSONSerialization dataWithJSONObject:@[selector] options:0 error:nil];
+        NSString *quoted = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+        NSString *script = [NSString stringWithFormat:@"(function(){var el=document.querySelector(%@[0]); if(!el){return 'no element';} el.click(); return 'clicked '+el.tagName+' '+(el.href||'');})()", quoted];
+        printf("[BCLICK] %s\n", [self.webview stringByEvaluatingJavaScriptFromString:script].UTF8String ?: "(null)");
+        fflush(stdout);
+    });
+    for (NSNumber *delay in @[@8.0, @14.0, @25.0]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            report([NSString stringWithFormat:@"%.0fs", delay.doubleValue]);
+        });
+    }
+}
+
+- (void)runFrameDiagnosticsIfRequested {
+    // Launch with -BrowserFrameDiagnostics YES (and optionally -BrowserFrameClickPoint 'x,y' in page
+    // coordinates): Play/Pause and clicks for a player embedded in an iframe, printing [BFRAME] lines.
+    static BOOL ranOnce = NO;
+    if (ranOnce || ![[NSUserDefaults standardUserDefaults] boolForKey:@"BrowserFrameDiagnostics"]) {
+        return;
+    }
+    ranOnce = YES;
+    NSString *pointString = [[NSUserDefaults standardUserDefaults] stringForKey:@"BrowserFrameClickPoint"];
+    NSArray<NSString *> *parts = [pointString componentsSeparatedByString:@","];
+    CGPoint clickPoint = parts.count == 2 ? CGPointMake(parts[0].doubleValue, parts[1].doubleValue) : CGPointZero;
+    void (^report)(NSString *) = ^(NSString *label) {
+        printf("[BFRAME] %s: pageFullscreen=%d topBarHidden=%d presented=%s\n", label.UTF8String, self.tabCoordinator.pageFullscreenActive, self.topMenuView.hidden,
+               self.presentedViewController ? NSStringFromClass(self.presentedViewController.class).UTF8String : "(none)");
+        fflush(stdout);
+    };
+    void (^playPause)(NSString *) = ^(NSString *label) {
+        [self.pageNavigator togglePrimaryVideoInWebView:self.webview completion:^(BOOL handled) {
+            printf("[BFRAME] Play/Pause (%s) handled=%d\n", label.UTF8String, handled);
+            fflush(stdout);
+        }];
+    };
+    NSMutableArray *steps = [@[
+        @[@12.0, ^{ playPause(@"expect unmute"); }],
+        @[@17.0, ^{ playPause(@"expect pause"); }],
+        @[@22.0, ^{ playPause(@"expect play"); }],
+    ] mutableCopy];
+    if (!CGPointEqualToPoint(clickPoint, CGPointZero)) {
+        [steps addObjectsFromArray:@[
+            @[@26.0, ^{ CGPoint hoverPoint = CGPointMake(clickPoint.x - 200, clickPoint.y - 200); [self.domInteractionService evaluateHoverStateJavaScriptAtPoint:hoverPoint webView:self.webview]; }],
+            @[@26.8, ^{ CGPoint hoverPoint = CGPointMake(clickPoint.x - 199, clickPoint.y - 200); [self.domInteractionService evaluateHoverStateJavaScriptAtPoint:hoverPoint webView:self.webview]; }],
+            @[@27.6, ^{ printf("[BFRAME] clicking %s\n", NSStringFromCGPoint(clickPoint).UTF8String); fflush(stdout); [self.pageActionCoordinator handlePageSelectionAtDOMPoint:clickPoint webView:self.webview]; }],
+            @[@31.0, ^{ report(@"after click"); }],
+            @[@33.0, ^{ printf("[BFRAME] pressing Menu\n"); fflush(stdout); [self browserRemoteInputControllerHandleMenuPress]; }],
+            @[@36.0, ^{ report(@"after Menu"); }],
+        ]];
+    }
+    for (NSArray *step in steps) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([step[0] doubleValue] * NSEC_PER_SEC)), dispatch_get_main_queue(), step[1]);
+    }
+}
+
 - (void)webViewDidFinishLoad:(id)webView {
     [self.tabCoordinator webViewDidFinishLoad:webView];
+    [self runFrameDiagnosticsIfRequested];
+    [self runClickDiagnosticsIfRequested];
     [self runBackDiagnosticsIfRequested];
     [self runControlsWakeDiagnosticsIfRequested];
     [self runNavigationDiagnosticsIfRequested:webView];

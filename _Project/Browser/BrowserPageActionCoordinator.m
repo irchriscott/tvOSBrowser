@@ -171,6 +171,12 @@ static UIColor *BrowserPageActionTextColor(void) {
     if ([self handleTargetBlankLinkAtDOMPoint:point webView:webView]) {
         return YES;
     }
+    // A player embedded from another site is just an <iframe> here: hand the click to the frame,
+    // which presses its own button at that spot (unmute, play, fullscreen, servers...).
+    NSString *frameScript = [NSString stringWithFormat:@"if (resolvedElement && resolvedElement.tagName === 'IFRAME' && window.__browserFrameBridge && window.__browserFrameBridge.send('%@', resolvedElement, 'click', x, y)) { return 'frame'; } return '';", [BrowserWebView frameBridgeToken]];
+    if ([[self.domInteractionService evaluateResolvedElementJavaScriptAtPoint:point webView:webView body:frameScript] isEqualToString:@"frame"]) {
+        return YES;
+    }
 
     NSString *fieldType = [self.domInteractionService evaluateResolvedElementJavaScriptAtPoint:point
                                                                                         webView:webView

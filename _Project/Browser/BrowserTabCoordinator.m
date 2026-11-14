@@ -936,7 +936,7 @@ static NSTimeInterval const kRepeatedCrashInterval = 30.0;
 
 - (void)showMaxTabsAlert {
     UIAlertController *alertController = [UIAlertController alertControllerWithTitle:@"Maximum Tabs Reached"
-                                                                             message:@"This build keeps up to five tabs open at once."
+                                                                             message:@"This build keeps up to ten tabs open at once."
                                                                       preferredStyle:UIAlertControllerStyleAlert];
     [alertController addAction:[UIAlertAction actionWithTitle:@"Dismiss"
                                                         style:UIAlertActionStyleCancel

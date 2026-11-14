@@ -5,7 +5,7 @@
 static NSUInteger const kDefaultTextFontSize = 100;
 static NSUInteger const kMinimumTextFontSize = 50;
 static NSUInteger const kMaximumTextFontSize = 200;
-static NSUInteger const kMaximumTabCount = 5;
+static NSUInteger const kMaximumTabCount = 10;
 @implementation BrowserViewModel
 
 - (instancetype)init {

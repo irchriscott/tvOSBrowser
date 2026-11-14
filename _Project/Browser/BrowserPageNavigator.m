@@ -10,7 +10,7 @@ static NSString *BrowserPageNavigatorLibrary(void) {
         "(function(){\n"
         "if (window.__bnav) { return; }\n"
         "var N = window.__bnav = { current: null, ring: null, lastRect: null, lastURL: null, focused: null, siteStyled: false };\n"
-        "var SELECTOR = \"a[href], button, input:not([type=hidden]), select, textarea, summary, video, [role=button], [role=link], [role=tab], [role=menuitem], [role=menuitemradio], [role=option], [role=checkbox], [role=switch], [onclick], [tabindex]:not([tabindex='-1']), [contenteditable=''], [contenteditable='true']\";\n"
+        "var SELECTOR = \"a[href], button, input:not([type=hidden]), select, textarea, summary, video, iframe, [role=button], [role=link], [role=tab], [role=menuitem], [role=menuitemradio], [role=option], [role=checkbox], [role=switch], [onclick], [tabindex]:not([tabindex='-1']), [contenteditable=''], [contenteditable='true']\";\n"
         "\n"
         "/* ---- Candidate cache: rebuilt only when the page changes ---- */\n"
         "var dirty = true, cachedElements = [], styleOK = null;\n"
@@ -84,7 +84,7 @@ static NSString *BrowserPageNavigatorLibrary(void) {
         "    if (!el.isConnected) { continue; }\n"
         "    var r = el.getBoundingClientRect();\n"
         "    if (!sizeOK(r) || !inBand(r)) { continue; }\n"
-        "    if (el.tagName !== 'VIDEO' && r.width * r.height > area * 0.6) { continue; }  /* page sections, not targets */\n"
+        "    if (el.tagName !== 'VIDEO' && el.tagName !== 'IFRAME' && r.width * r.height > area * 0.6) { continue; }  /* page sections, not targets */\n"
         "    if (!styleUsable(el)) { continue; }\n"
         "    out.push(info(el, r));\n"
         "  }\n"
@@ -328,6 +328,7 @@ static NSString *BrowserPageNavigatorLibrary(void) {
         "  if (!el || !el.isConnected) { return 'none'; }\n"
         "  if (isTextEntry(el)) { return 'text'; }\n"
         "  if (el.tagName === 'VIDEO' && !force) { return 'video'; }\n"
+        "  if (el.tagName === 'IFRAME') { return 'frame'; }  /* embedded player: the app hands the click to the frame */\n"
         "  var r = el.getBoundingClientRect();\n"
         "  var x = r.left + r.width / 2, y = r.top + r.height / 2;\n"
         "  function fire(type) {\n"
@@ -370,7 +371,7 @@ static NSString *BrowserPageNavigatorLibrary(void) {
 /// Shared by wake and play/pause: the largest visible video covering at least a quarter of
 /// the viewport, and a function that sends mouse movement where the user is "looking".
 static NSString *BrowserPageVideoHelpers(void) {
-    return @"function __bPrimaryVideo() {"
+    return [[NSString stringWithFormat:@"var __bToken = '%@';", [BrowserWebView frameBridgeToken]] stringByAppendingString:@"function __bPrimaryVideo() {"
             "var best = null, bestArea = innerWidth * innerHeight * 0.25;"
             "var videos = document.querySelectorAll('video');"
             "for (var i = 0; i < videos.length; i++) {"
@@ -395,7 +396,9 @@ static NSString *BrowserPageVideoHelpers(void) {
                 "try { target.dispatchEvent(type.indexOf('pointer') === 0 && window.PointerEvent ? new PointerEvent(type, init) : new MouseEvent(type, init)); } catch (e) {}"
             "});"
             "if (video && video !== target) { try { video.dispatchEvent(new MouseEvent('mousemove', init)); } catch (e) {} }"
-        "}";
+            // A player embedded from another site: move the mouse inside its frame.
+            "if (target && target.tagName === 'IFRAME' && window.__browserFrameBridge) { window.__browserFrameBridge.send(__bToken, target, 'hover', x, y); }"
+        "}"];
 }
 
 static NSString *BrowserPageNavigationDirectionName(BrowserPageNavigationDirection direction) {
@@ -446,7 +449,11 @@ static NSString *BrowserPageNavigationDirectionName(BrowserPageNavigationDirecti
 }
 
 - (void)togglePrimaryVideoInWebView:(BrowserWebView *)webView completion:(void (^)(BOOL))completion {
-    NSString *script = [NSString stringWithFormat:@"(function(){%@ var v = __bPrimaryVideo(); if (!v) { return 'none'; } __bWake(v);"
+    // No video in the page itself: the player may be embedded from another site (an iframe).
+    // A playing but muted video (players start muted) is unmuted first.
+    NSString *script = [NSString stringWithFormat:@"(function(){%@ var v = __bPrimaryVideo();"
+                        "if (!v) { return window.__browserFrameBridge && window.__browserFrameBridge.toggleMainFrame(__bToken) ? 'frame' : 'none'; } __bWake(v);"
+                        "if (!v.paused && !v.ended && v.muted) { v.muted = false; if (!v.volume) { v.volume = 1; } return 'unmuted'; }"
                         "if (v.paused || v.ended) { var p = v.play(); if (p && p.catch) { p.catch(function() {}); } return 'playing'; }"
                         "v.pause(); return 'paused';})()", BrowserPageVideoHelpers()];
     [webView evaluateJavaScript:script completionHandler:^(id result, __unused NSError *error) {

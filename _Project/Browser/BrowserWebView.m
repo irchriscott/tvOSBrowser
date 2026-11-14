@@ -756,7 +756,12 @@ static NSString *BrowserFullscreenPolyfillScript(void) {
         "if (typeof Element.prototype.requestFullscreen === 'function' || typeof Element.prototype.webkitRequestFullscreen === 'function') { return; }"
         "window.__browserFullscreenPolyfill = true;"
         "var current = null;"
-        "function notify(active) { try { window.webkit.messageHandlers.browserFullscreen.postMessage({ active: active }); } catch (e) {} }"
+        // The top page tells the app (top bar, Menu to exit); a player inside an iframe asks its parent
+        // page to stretch the iframe (see the frame bridge), which passes it on up to the top.
+        "function notify(active) {"
+            "if (window.top === window) { try { window.webkit.messageHandlers.browserFullscreen.postMessage({ active: active }); } catch (e) {} return; }"
+            "try { window.parent.postMessage({ __bfbUp: 'fs', active: active }, '*'); } catch (e) {}"
+        "}"
         "function ensureStyle() {"
             "if (document.getElementById('__browser-fullscreen-style')) { return; }"
             "var style = document.createElement('style'); style.id = '__browser-fullscreen-style';"
@@ -798,6 +803,7 @@ static NSString *BrowserFullscreenPolyfillScript(void) {
             "if (!current) { return Promise.resolve(); }"
             "var element = current; current = null;"
             "element.removeAttribute('data-browser-fullscreen');"
+            "if (element.tagName === 'IFRAME') { try { element.contentWindow.postMessage({ __bfb: 'fsexit' }, '*'); } catch (e) {} }"
             "document.documentElement.classList.remove('__browser-fullscreen');"
             "notify(false);"
             "if (!silent) { fire(element, ['fullscreenchange', 'webkitfullscreenchange']); }"
@@ -825,6 +831,116 @@ static NSString *BrowserFullscreenPolyfillScript(void) {
         "window.__browserExitFullscreen = function() { leave(false); };"
         "new MutationObserver(function() { if (current && !document.contains(current)) { leave(false); } }).observe(document.documentElement, { childList: true, subtree: true });"
     "})();";
+}
+
+#pragma mark - Frame bridge (players inside cross-site iframes)
+
+/// Random per launch. Only the app knows it (it lives in a closure of the user script and in the
+/// scripts the app evaluates), so pages cannot use the bridge to click inside frames they embed.
+static NSString *BrowserFrameBridgeTokenValue(void) {
+    static NSString *token;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        token = [[NSUUID UUID].UUIDString stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    });
+    return token;
+}
+
+/// The app's clicks and hovers are dispatched by script in the top page, where a cross-site player
+/// is just an <iframe> element, so its buttons (unmute, play, fullscreen, servers) never got them.
+/// This script runs in every frame: the top page hands a click/hover/Play-Pause to the iframe under
+/// the point, and each frame applies it to its own element there (or hands it on to a nested frame).
+/// It also lets a player inside an iframe go fullscreen: the parent stretches that iframe, but only
+/// right after the user clicked into it, so ad frames cannot take over the screen.
+static NSString *BrowserFrameBridgeScript(void) {
+    NSString *script = @"(function(){"
+        "if (window.__browserFrameBridge) { return; }"
+        "var TOKEN = '__TOKEN__';"
+        "function localPoint(frame, x, y) {"
+            "var r = frame.getBoundingClientRect(), cs = getComputedStyle(frame);"
+            "return { x: x - r.left - (parseFloat(cs.borderLeftWidth) || 0) - (parseFloat(cs.paddingLeft) || 0),"
+                     "y: y - r.top - (parseFloat(cs.borderTopWidth) || 0) - (parseFloat(cs.paddingTop) || 0) };"
+        "}"
+        "function sendDown(frame, kind, x, y) {"
+            "if (!frame || !frame.contentWindow) { return false; }"
+            "if (kind !== 'hover') { frame.__browserBridgeAt = Date.now(); }"
+            "var p = localPoint(frame, x, y);"
+            "try { frame.contentWindow.postMessage({ __bfb: kind, t: TOKEN, x: p.x, y: p.y }, '*'); return true; } catch (e) { return false; }"
+        "}"
+        "function fire(target, type, x, y, related) {"
+            "var init = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y, button: 0, buttons: /down/.test(type) ? 1 : 0, relatedTarget: related || null, pointerType: 'mouse', isPrimary: true };"
+            "try { target.dispatchEvent(type.indexOf('pointer') === 0 && window.PointerEvent ? new PointerEvent(type, init) : new MouseEvent(type, init)); } catch (e) {}"
+        "}"
+        "var hoverTarget = null;"
+        "function hover(el, x, y) {"
+            "if (hoverTarget !== el) {"
+                "if (hoverTarget && hoverTarget.isConnected) { fire(hoverTarget, 'pointerout', x, y, el); fire(hoverTarget, 'mouseout', x, y, el); }"
+                "fire(el, 'pointerover', x, y, hoverTarget); fire(el, 'mouseover', x, y, hoverTarget); hoverTarget = el;"
+            "}"
+            "fire(el, 'pointermove', x, y); fire(el, 'mousemove', x, y);"
+        "}"
+        "function largest(selector) {"
+            "var best = null, bestArea = innerWidth * innerHeight * 0.2;"
+            "Array.prototype.forEach.call(document.querySelectorAll(selector), function(el) {"
+                "var r = el.getBoundingClientRect();"
+                "var w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)), h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));"
+                "if (w * h >= bestArea) { bestArea = w * h; best = el; }"
+            "});"
+            "return best;"
+        "}"
+        "function centre(el) { var r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; }"
+        // Play/Pause on the remote: the frame's main video (a muted live stream is unmuted first,
+        // since players start muted and their unmute button is tiny), else the main nested frame.
+        "function toggle() {"
+            "var v = largest('video');"
+            "if (v) {"
+                "var c = centre(v); var at = document.elementFromPoint(c.x, c.y) || v; hover(at, c.x, c.y);"
+                "if (!v.paused && !v.ended && v.muted) { v.muted = false; if (!v.volume) { v.volume = 1; } return; }"
+                "if (v.paused || v.ended) { var p = v.play(); if (p && p.catch) { p.catch(function() {}); } } else { v.pause(); }"
+                "return;"
+            "}"
+            "var f = largest('iframe'); if (f) { var fc = centre(f); sendDown(f, 'toggle', fc.x, fc.y); }"
+        "}"
+        "function handle(kind, x, y) {"
+            "if (kind === 'toggle') { toggle(); return; }"
+            "var el = document.elementFromPoint(x, y);"
+            "if (!el) { return; }"
+            "if (el.tagName === 'IFRAME') { sendDown(el, kind, x, y); return; }"
+            "hover(el, x, y);"
+            "if (kind !== 'click') { return; }"
+            "try { if (el.focus) { el.focus({ preventScroll: true }); } } catch (e) {}"
+            "['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(function(type) { fire(el, type, x, y); });"
+            "if (typeof el.click === 'function') { el.click(); } else { fire(el, 'click', x, y); }"
+        "}"
+        "function frameFor(source) {"
+            "var frames = document.querySelectorAll('iframe');"
+            "for (var i = 0; i < frames.length; i++) { if (frames[i].contentWindow === source) { return frames[i]; } }"
+            "return null;"
+        "}"
+        "window.addEventListener('message', function(e) {"
+            "var d = e.data; if (!d || typeof d !== 'object') { return; }"
+            "if (d.__bfb && e.source === window.parent && e.source !== window) {"
+                "if (d.__bfb === 'fsexit') { if (window.__browserExitFullscreen) { window.__browserExitFullscreen(); } return; }"
+                "if (d.t !== TOKEN) { return; }"
+                "handle(d.__bfb, +d.x || 0, +d.y || 0);"
+                "return;"
+            "}"
+            "if (d.__bfbUp === 'fs') {"
+                "var frame = frameFor(e.source); if (!frame) { return; }"
+                "if (d.active) {"
+                    "if (!frame.__browserBridgeAt || Date.now() - frame.__browserBridgeAt > 8000) { return; }"
+                    "frame.__browserBridgeAt = Date.now();"
+                    "if (frame.requestFullscreen) { frame.requestFullscreen(); }"
+                "} else if (document.fullscreenElement === frame && document.exitFullscreen) { document.exitFullscreen(); }"
+            "}"
+        "});"
+        "var api = {"
+            "send: function(token, frame, kind, x, y) { return token === TOKEN && !!frame && frame.tagName === 'IFRAME' && sendDown(frame, kind, x, y); },"
+            "toggleMainFrame: function(token) { if (token !== TOKEN) { return false; } var f = largest('iframe'); if (!f) { return false; } var c = centre(f); return sendDown(f, 'toggle', c.x, c.y); }"
+        "};"
+        "try { Object.defineProperty(window, '__browserFrameBridge', { value: Object.freeze(api), writable: false, configurable: false }); } catch (e) {}"
+    "})();";
+    return [script stringByReplacingOccurrencesOfString:@"__TOKEN__" withString:BrowserFrameBridgeTokenValue()];
 }
 
 /// WKUserContentController retains its message handlers; a weak proxy avoids a retain cycle.
@@ -867,9 +983,21 @@ static NSString *BrowserMediaDiagnosticsHookScript(void) {
     return @"(function(){"
         "if (window.__bdiag) { return; }"
         "var D = window.__bdiag = { events: [], t0: Date.now() };"
+        // Runs in every frame; sub-frames forward their lines to the top page, tagged with their host.
+        "var isTop = window.top === window;"
+        "function push(line) { D.events.push(line); if (D.events.length > 400) { D.events.shift(); } }"
         "function log(kind, msg) {"
-            "D.events.push(((Date.now() - D.t0) / 1000).toFixed(1) + 's ' + kind + ' ' + String(msg).slice(0, 220));"
-            "if (D.events.length > 400) { D.events.shift(); }"
+            "var line = ((Date.now() - D.t0) / 1000).toFixed(1) + 's ' + kind + ' ' + String(msg).slice(0, 220);"
+            "if (isTop) { push(line); return; }"
+            "try { window.top.postMessage({ __bdiagLine: '[' + location.host + '] ' + line }, '*'); } catch (e) {}"
+        "}"
+        "if (isTop) { window.addEventListener('message', function(e) { if (e.data && e.data.__bdiagLine) { push(String(e.data.__bdiagLine)); } });"
+            "setTimeout(function() { log('iframes', Array.prototype.map.call(document.querySelectorAll('iframe'), function(f) { var r = f.getBoundingClientRect(); return String(f.src).slice(0, 50) + ' @' + Math.round(r.left) + ',' + Math.round(r.top) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height); }).join(' ;; ')); }, 9000); }"
+        "else {"
+            "log('frame', location.href.slice(0, 160));"
+            "window.addEventListener('message', function(e) { var d = e.data; if (!d || !d.__bfb) { return; } var el = document.elementFromPoint(+d.x || 0, +d.y || 0); log('bridge', d.__bfb + ' @' + Math.round(d.x) + ',' + Math.round(d.y) + ' -> ' + (el ? el.tagName + '.' + String(el.className || '').slice(0, 50) + (el.closest && el.closest('a') ? ' href=' + String(el.closest('a').href).slice(0, 80) + ' target=' + el.closest('a').target + ' z=' + getComputedStyle(el.closest('a')).zIndex + ' pos=' + getComputedStyle(el.closest('a')).position + ' parent=' + el.closest('a').parentElement.tagName : '') : 'nothing')); });"
+            "var reportControls = function() { var out = []; Array.prototype.forEach.call(document.querySelectorAll('button,[role=button],[class*=button],[class*=fullscreen],[class*=volume],[class*=mute]'), function(el) { var d = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + String(el.className || '') + ' ' + (el.getAttribute('data-fullscreen') !== null ? 'data-fullscreen' : '')).toLowerCase(); if (!/full|screen|mute|volume|sound/.test(d)) { return; } var r = el.getBoundingClientRect(); if (r.width * r.height === 0) { return; } out.push('[' + d.replace(/\\s+/g, ' ').trim().slice(0, 50) + '] ' + Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2)); }); log('controls', innerWidth + 'x' + innerHeight + ' ' + out.slice(0, 12).join(' ;; ')); }; setTimeout(reportControls, 9000); setTimeout(reportControls, 27500);"
+            "setInterval(function() { Array.prototype.forEach.call(document.querySelectorAll('video'), function(v) { log('video-state', 'src=' + String(v.currentSrc || v.src || '').slice(0, 90) + ' rs=' + v.readyState + ' paused=' + v.paused + ' muted=' + v.muted + ' vol=' + v.volume + ' t=' + (v.currentTime || 0).toFixed(1) + (v.error ? ' ERR=' + v.error.code : '')); }); }, 5000);"
         "}"
         "D.log = log;"
         "window.addEventListener('error', function(e) { log('js-error', (e.message || (e.target && e.target.src) || '') + ' @' + (e.filename || '') + ':' + (e.lineno || '')); }, true);"
@@ -1036,7 +1164,7 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
     }
     id userContentController = ((id (*)(id, SEL))objc_msgSend)(configuration, userContentControllerGetter);
     id userScript = ((id (*)(id, SEL))objc_msgSend)((id)userScriptClass, @selector(alloc));
-    userScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(userScript, userScriptInitializer, BrowserMediaDiagnosticsHookScript(), 0, YES);
+    userScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(userScript, userScriptInitializer, BrowserMediaDiagnosticsHookScript(), 0, NO);
     if (userContentController != nil && userScript != nil) {
         ((void (*)(id, SEL, id))objc_msgSend)(userContentController, NSSelectorFromString(@"addUserScript:"), userScript);
         BrowserDiagPrint(@"diagnostics hooks installed");
@@ -1126,8 +1254,12 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
         SEL userScriptInitializer = NSSelectorFromString(@"initWithSource:injectionTime:forMainFrameOnly:");
         if (userScriptClass != Nil && [userScriptClass instancesRespondToSelector:userScriptInitializer]) {
             id userScript = ((id (*)(id, SEL))objc_msgSend)((id)userScriptClass, @selector(alloc));
-            userScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(userScript, userScriptInitializer, BrowserFullscreenPolyfillScript(), 0, YES);
+            // All frames: players embedded from other sites go fullscreen through their parent page.
+            userScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(userScript, userScriptInitializer, BrowserFullscreenPolyfillScript(), 0, NO);
             ((void (*)(id, SEL, id))objc_msgSend)(userContentController, NSSelectorFromString(@"addUserScript:"), userScript);
+            id bridgeScript = ((id (*)(id, SEL))objc_msgSend)((id)userScriptClass, @selector(alloc));
+            bridgeScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(bridgeScript, userScriptInitializer, BrowserFrameBridgeScript(), 0, NO);
+            ((void (*)(id, SEL, id))objc_msgSend)(userContentController, NSSelectorFromString(@"addUserScript:"), bridgeScript);
             // Remote navigation library, ready before the first arrow press (document end, main frame).
             id navigatorScript = ((id (*)(id, SEL))objc_msgSend)((id)userScriptClass, @selector(alloc));
             navigatorScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(navigatorScript, userScriptInitializer, [BrowserPageNavigator libraryScript], 1, YES);
@@ -1625,6 +1757,15 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
         (CACurrentMediaTime() - self.appInitiatedTimestamp) < 3.0;
 }
 
+/// WebKit (private): a content rule list acted on a load. Logged in diagnostics mode so sites the
+/// ad blocker breaks can be traced to the exact request.
+- (void)_webView:(id)webView contentRuleListWithIdentifier:(NSString *)identifier performedAction:(id)action forURL:(NSURL *)url {
+    if (BrowserMediaDiagnosticsEnabled()) {
+        BOOL blocked = [action respondsToSelector:NSSelectorFromString(@"blockedLoad")] && ((BOOL (*)(id, SEL))objc_msgSend)(action, NSSelectorFromString(@"blockedLoad"));
+        BrowserDiagPrint([NSString stringWithFormat:@"adblock %@ %@", blocked ? @"BLOCKED" : @"css-hide", url.absoluteString.length > 200 ? [url.absoluteString substringToIndex:200] : url.absoluteString]);
+    }
+}
+
 - (void)webView:(id)webView didFinishNavigation:(id)navigation {
     [self startMediaDiagnosticsIfNeeded];
     if ([BrowserAdBlocker sharedBlocker].enabled) {
@@ -1743,6 +1884,10 @@ windowFeatures:(id)windowFeatures {
     }
 
     return nil;
+}
+
++ (NSString *)frameBridgeToken {
+    return BrowserFrameBridgeTokenValue();
 }
 
 + (id)defaultWebsiteDataStore {
