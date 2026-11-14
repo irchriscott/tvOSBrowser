@@ -59,6 +59,12 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)dismissHomeIfNeeded;
 /// Hides Home and returns to the page it covers. Returns NO when there is no page.
 - (BOOL)returnFromHomeToPage;
+/// The active tab was opened from another tab that is still open.
+- (BOOL)canReturnToOpenerTab;
+/// Closes the active tab and switches back to the tab that opened it.
+- (BOOL)returnToOpenerTab;
+/// Home is covering a page that Back can return to.
+@property (nonatomic, readonly) BOOL activeTabHasPageBehindHome;
 - (void)createNewTabLoadingHomePage:(BOOL)loadHomePage;
 - (BOOL)createNewTabWithRequest:(NSURLRequest *)request;
 - (void)switchToTabAtIndex:(NSInteger)tabIndex;

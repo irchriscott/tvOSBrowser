@@ -212,6 +212,37 @@ static NSString *BrowserPageNavigatorLibrary(void) {
     "})();";
 }
 
+/// Shared by wake and play/pause: the largest visible video covering at least a quarter of
+/// the viewport, and a function that sends mouse movement where the user is "looking".
+static NSString *BrowserPageVideoHelpers(void) {
+    return @"function __bPrimaryVideo() {"
+            "var best = null, bestArea = innerWidth * innerHeight * 0.25;"
+            "var videos = document.querySelectorAll('video');"
+            "for (var i = 0; i < videos.length; i++) {"
+                "var r = videos[i].getBoundingClientRect();"
+                "var w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));"
+                "var h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));"
+                "if (w * h >= bestArea) { bestArea = w * h; best = videos[i]; }"
+            "}"
+            "return best;"
+        "}"
+        "function __bWake(video) {"
+            "var x, y; var nav = window.__bnav;"
+            "var current = nav && nav.current && document.contains(nav.current) ? nav.current.getBoundingClientRect() : null;"
+            "if (current && current.bottom > 0 && current.top < innerHeight) { x = current.left + current.width / 2; y = current.top + current.height / 2; }"
+            "else if (video) { var vr = video.getBoundingClientRect(); x = vr.left + vr.width / 2; y = vr.top + vr.height / 2; }"
+            "else { x = innerWidth / 2; y = innerHeight / 2; }"
+            // Wiggle by a pixel so sites that ignore repeated identical positions still react.
+            "window.__bWakeFlip = !window.__bWakeFlip; x += window.__bWakeFlip ? 1 : 0;"
+            "var target = document.elementFromPoint(Math.min(Math.max(x, 0), innerWidth - 1), Math.min(Math.max(y, 0), innerHeight - 1)) || video || document.body;"
+            "var init = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y, pointerType: 'mouse', isPrimary: true };"
+            "['pointerover', 'mouseover', 'pointermove', 'mousemove'].forEach(function(type) {"
+                "try { target.dispatchEvent(type.indexOf('pointer') === 0 && window.PointerEvent ? new PointerEvent(type, init) : new MouseEvent(type, init)); } catch (e) {}"
+            "});"
+            "if (video && video !== target) { try { video.dispatchEvent(new MouseEvent('mousemove', init)); } catch (e) {} }"
+        "}";
+}
+
 static NSString *BrowserPageNavigationDirectionName(BrowserPageNavigationDirection direction) {
     switch (direction) {
         case BrowserPageNavigationDirectionUp: return @"up";
@@ -224,9 +255,46 @@ static NSString *BrowserPageNavigationDirectionName(BrowserPageNavigationDirecti
 
 @implementation BrowserPageNavigator
 
+- (void)wakePageInWebView:(BrowserWebView *)webView completion:(void (^)(BOOL))completion {
+    NSString *script = [NSString stringWithFormat:@"(function(){%@ var v = __bPrimaryVideo(); __bWake(v); return v ? 'video' : 'none';})()", BrowserPageVideoHelpers()];
+    [webView evaluateJavaScript:script completionHandler:^(id result, __unused NSError *error) {
+        if (completion != nil) {
+            completion([result isKindOfClass:[NSString class]] && [result isEqualToString:@"video"]);
+        }
+    }];
+}
+
+- (void)togglePrimaryVideoInWebView:(BrowserWebView *)webView completion:(void (^)(BOOL))completion {
+    NSString *script = [NSString stringWithFormat:@"(function(){%@ var v = __bPrimaryVideo(); if (!v) { return 'none'; } __bWake(v);"
+                        "if (v.paused || v.ended) { var p = v.play(); if (p && p.catch) { p.catch(function() {}); } return 'playing'; }"
+                        "v.pause(); return 'paused';})()", BrowserPageVideoHelpers()];
+    [webView evaluateJavaScript:script completionHandler:^(id result, __unused NSError *error) {
+        if (completion != nil) {
+            completion([result isKindOfClass:[NSString class]] && ![result isEqualToString:@"none"]);
+        }
+    }];
+}
+
 - (void)moveInDirection:(BrowserPageNavigationDirection)direction
                 webView:(BrowserWebView *)webView
              completion:(void (^)(BrowserPageNavigationResult))completion {
+    __weak typeof(self) weakSelf = self;
+    __weak BrowserWebView *weakWebView = webView;
+    [self wakePageInWebView:webView completion:^(BOOL videoOnScreen) {
+        // Player controls fade back in after the wake-up; give them a moment so the move
+        // can land on them instead of skipping them as invisible.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((videoOnScreen ? 0.22 : 0.0) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            BrowserWebView *strongWebView = weakWebView;
+            if (strongWebView != nil) {
+                [weakSelf performMoveInDirection:direction webView:strongWebView completion:completion];
+            }
+        });
+    }];
+}
+
+- (void)performMoveInDirection:(BrowserPageNavigationDirection)direction
+                       webView:(BrowserWebView *)webView
+                    completion:(void (^)(BrowserPageNavigationResult))completion {
     NSString *script = [NSString stringWithFormat:@"%@ window.__bnav.move('%@');",
                         BrowserPageNavigatorLibrary(), BrowserPageNavigationDirectionName(direction)];
     // Asynchronous: arrow presses arrive inside UIKit event handling, where a

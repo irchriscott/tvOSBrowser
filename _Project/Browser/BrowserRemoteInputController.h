@@ -27,6 +27,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)browserRemoteInputControllerHandleNavigationPress:(UIPressType)pressType;
 /// The user switched between cursor and navigation mode with a double press.
 - (void)browserRemoteInputControllerDidToggleCursorMode:(BOOL)cursorModeEnabled;
+/// The touch surface was touched while in navigation mode (no cursor).
+- (void)browserRemoteInputControllerDidTouchSurfaceInNavigationMode;
 
 @end
 

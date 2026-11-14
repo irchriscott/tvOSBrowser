@@ -55,6 +55,9 @@ static UIColor *kTextColor(void) {
 @property (nonatomic) UIVisualEffectView *toastView;
 @property (nonatomic) UILabel *toastLabel;
 @property (nonatomic) BOOL homeWasVisible;
+/// The current Back/Menu press is handled by the app (not passed to tvOS, which would leave the app).
+@property (nonatomic) BOOL handlingMenuPress;
+@property (nonatomic) CFTimeInterval lastNavigationWakeTimestamp;
 /// Cursor/scroll mode to return to on web pages; Home always runs without the cursor.
 @property (nonatomic) BOOL cursorModeBeforeHome;
 
@@ -236,6 +239,7 @@ static UIColor *kTextColor(void) {
     if (self.webview == nil || self.tabCoordinator.showingHome) {
         return;
     }
+    [self.pageNavigator wakePageInWebView:self.webview completion:nil];
     NSValue *point = [self.pageNavigator activationPointInWebView:self.webview];
     if (point == nil) {
         [self showToast:@"Click the edges of the remote's touch surface to pick a link"];
@@ -348,10 +352,13 @@ static UIColor *kTextColor(void) {
     BOOL showingHome = self.tabCoordinator.showingHome;
     switch (action) {
         case BrowserTopBarActionBack:
-            if (showingHome) {
-                [self.tabCoordinator returnFromHomeToPage];
-            } else if (self.webview.canGoBack) {
+            if (showingHome && [self.tabCoordinator returnFromHomeToPage]) {
+                break;
+            }
+            if (!showingHome && self.webview.canGoBack) {
                 [self.webview goBack];
+            } else {
+                [self.tabCoordinator returnToOpenerTab];
             }
             break;
         case BrowserTopBarActionRefresh:
@@ -525,7 +532,7 @@ static UIColor *kTextColor(void) {
 
 - (void)showHintsAlert {
     UIAlertController *alertController = [UIAlertController alertControllerWithTitle:@"Usage Guide"
-                                                                             message:@"Double press the touch area to switch between cursor & navigation mode.\nPress the touch area while in cursor mode to click.\nIn navigation mode, click the edges of the touch surface to move between links and buttons, swipe to scroll, and press Select to open.\nSingle tap to Menu button to Go Back, or Exit on root page.\nSingle tap the Play/Pause button to: Go Forward, Enter URL or Reload Page.\nDouble tap the Play/Pause to show the Advanced Menu with more options.\nUse the tabs icon in the top bar to open the tab overview."
+                                                                             message:@"Double press the touch area to switch between cursor & navigation mode.\nPress the touch area while in cursor mode to click.\nIn navigation mode, click the edges of the touch surface to move between links and buttons, swipe to scroll, and press Select to open.\nPress Back (Menu) to go to the previous page; with nothing left to go back to, it returns to the Apple TV Home screen.\nSingle tap the Play/Pause button to: Go Forward, Enter URL or Reload Page.\nDouble tap the Play/Pause to show the Advanced Menu with more options.\nUse the tabs icon in the top bar to open the tab overview."
                                                                       preferredStyle:UIAlertControllerStyleAlert];
 
     __weak typeof(self) weakSelf = self;
@@ -828,27 +835,32 @@ static UIColor *kTextColor(void) {
     [self browserHandlePrimaryAction];
 }
 
+/// Whether Back/Menu has something to go back to inside the app. When it does not,
+/// the press is passed to tvOS, which returns to the Home screen like any Apple TV app.
+- (BOOL)appHandlesMenuPress {
+    if (self.presentedViewController != nil || self.topBarFocusActive || self.tabOverviewController.visible ||
+        self.tabCoordinator.pageFullscreenActive) {
+        return YES;
+    }
+    if (self.tabCoordinator.showingHome) {
+        return self.tabCoordinator.activeTabHasPageBehindHome || [self.tabCoordinator canReturnToOpenerTab];
+    }
+    return self.webview.canGoBack || [self.tabCoordinator canReturnToOpenerTab];
+}
+
 - (void)browserRemoteInputControllerHandleMenuPress {
-    UIAlertController *alertController = (UIAlertController *)self.presentedViewController;
-    if (alertController != nil) {
+    if (self.presentedViewController != nil) {
         [self.presentedViewController dismissViewControllerAnimated:YES completion:nil];
     } else if (self.tabCoordinator.pageFullscreenActive) {
         [self exitPageFullscreen];
     } else if ([self.tabCoordinator returnFromHomeToPage]) {
         return;
     } else if (!self.tabCoordinator.showingHome && self.webview.canGoBack) {
+        // Back through this tab's own history (including in-page history entries).
         [self.webview goBack];
-    } else {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Exit App?"
-                                                                       message:nil
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Exit"
-                                                  style:UIAlertActionStyleDestructive
-                                                handler:^(__unused UIAlertAction *action) {
-            exit(EXIT_SUCCESS);
-        }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Dismiss" style:UIAlertActionStyleCancel handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
+    } else if ([self.tabCoordinator returnToOpenerTab]) {
+        // First page of a tab opened from a link: close it and return to where it came from.
+        return;
     }
 }
 
@@ -856,6 +868,15 @@ static UIColor *kTextColor(void) {
     UIAlertController *alertController = (UIAlertController *)self.presentedViewController;
     if (alertController != nil) {
         [self.presentedViewController dismissViewControllerAnimated:YES completion:nil];
+    } else if (self.webview != nil && !self.tabCoordinator.showingHome) {
+        // On a video page Play/Pause controls the video (and shows its controls), like Apple TV apps.
+        // Pages without a large video keep the Quick Menu.
+        __weak typeof(self) weakSelf = self;
+        [self.pageNavigator togglePrimaryVideoInWebView:self.webview completion:^(BOOL handled) {
+            if (!handled && weakSelf.presentedViewController == nil) {
+                [weakSelf requestURLorSearchInput];
+            }
+        }];
     } else {
         [self requestURLorSearchInput];
     }
@@ -902,6 +923,18 @@ static UIColor *kTextColor(void) {
             [weakSelf activateTopBarFocusMode];
         }
     }];
+}
+
+- (void)browserRemoteInputControllerDidTouchSurfaceInNavigationMode {
+    if (self.webview == nil || self.tabCoordinator.showingHome) {
+        return;
+    }
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - self.lastNavigationWakeTimestamp < 0.5) {
+        return;
+    }
+    self.lastNavigationWakeTimestamp = now;
+    [self.pageNavigator wakePageInWebView:self.webview completion:nil];
 }
 
 - (void)browserRemoteInputControllerDidToggleCursorMode:(BOOL)cursorModeEnabled {
@@ -1150,8 +1183,75 @@ static UIColor *kTextColor(void) {
     });
 }
 
+- (void)runControlsWakeDiagnosticsIfRequested {
+    // Launch with -BrowserControlsWakeDiagnostics YES on a video page (navigation mode).
+    static BOOL ranOnce = NO;
+    if (ranOnce || ![[NSUserDefaults standardUserDefaults] boolForKey:@"BrowserControlsWakeDiagnostics"]) {
+        return;
+    }
+    ranOnce = YES;
+    NSString *barState = @"(function(){var b=document.querySelector('button[aria-label=Fullscreen]'); var chain=[]; var e=b; for(var k=0;k<9&&e;k++){var cs=getComputedStyle(e); chain.push(e.tagName+'.'+String(e.className).replace(/\\s+/g,'.').slice(0,60)+'[op='+cs.opacity+',vis='+cs.visibility+',tf='+cs.transform+',pe='+cs.pointerEvents+',disp='+cs.display+']'); e=e.parentElement;} window.__bwakeChain=chain.join(' > '); var v=document.querySelector('video'); var bar=b; for(var i=0;i<4&&bar&&bar.parentElement;i++){bar=bar.parentElement;} var o=function(e){var x=1; while(e){x*=parseFloat(getComputedStyle(e).opacity); e=e.parentElement;} return x.toFixed(2);}; var cur=window.__bnav&&window.__bnav.current; return 'chain='+window.__bwakeChain+' || controlsOpacity='+(b?o(b):'n/a')+' video='+(v?(v.paused?'paused':'playing')+' t='+v.currentTime.toFixed(1):'none')+' highlight='+(cur?(cur.getAttribute('aria-label')||cur.tagName):'none');})()";
+    void (^logState)(NSString *) = ^(NSString *label) {
+        printf("[BWAKE] %s: %s\n", label.UTF8String, [self.webview stringByEvaluatingJavaScriptFromString:barState].UTF8String ?: "");
+        fflush(stdout);
+    };
+    NSArray *steps = @[
+        @[@5.0, ^{ [self.remoteInputController setCursorModeEnabled:NO]; [self browserRemoteInputControllerHandlePlayPausePress]; }],
+        @[@6.0, ^{ logState(@"Play/Pause pressed, navigation mode"); }],
+        @[@16.0, ^{ logState(@"after 10s idle"); }],
+        @[@16.5, ^{ [self browserRemoteInputControllerDidTouchSurfaceInNavigationMode]; }],
+        @[@17.0, ^{ logState(@"0.5s after touching the surface"); }],
+        @[@27.0, ^{ logState(@"after 10s idle again"); }],
+        @[@27.5, ^{ [self browserRemoteInputControllerHandleNavigationPress:UIPressTypeDownArrow]; }],
+        @[@28.5, ^{ logState(@"1s after pressing down"); }],
+        @[@29.0, ^{ [self browserRemoteInputControllerHandleNavigationPress:UIPressTypeRightArrow]; }],
+        @[@30.0, ^{ logState(@"1s after pressing right"); }],
+        @[@31.0, ^{ [self browserRemoteInputControllerHandlePlayPausePress]; }],
+        @[@32.0, ^{ logState(@"1s after Play/Pause"); }],
+        @[@33.0, ^{ [self browserRemoteInputControllerHandlePlayPausePress]; }],
+        @[@34.0, ^{ logState(@"1s after Play/Pause again"); printf("[BWAKE] quick menu shown=%s\n", self.presentedViewController ? "yes" : "no"); }],
+    ];
+    for (NSArray *step in steps) {
+        void (^block)(void) = step[1];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([step[0] doubleValue] * NSEC_PER_SEC)), dispatch_get_main_queue(), block);
+    }
+}
+
+- (void)runBackDiagnosticsIfRequested {
+    // Launch with -BrowserBackDiagnostics YES: checks what Back/Menu would do at each step.
+    static BOOL ranOnce = NO;
+    if (ranOnce || ![[NSUserDefaults standardUserDefaults] boolForKey:@"BrowserBackDiagnostics"]) {
+        return;
+    }
+    ranOnce = YES;
+    void (^report)(NSString *) = ^(NSString *label) {
+        printf("[BBACK] %s: tabs=%lu active=%ld url=%s canGoBack=%d canReturnToOpener=%d appHandlesBack=%d\n", label.UTF8String,
+               (unsigned long)self.viewModel.tabs.count, (long)self.viewModel.activeTabIndex,
+               self.webview.request.URL.absoluteString.UTF8String ?: "(none)", self.webview.canGoBack,
+               [self.tabCoordinator canReturnToOpenerTab], [self appHandlesMenuPress]);
+        fflush(stdout);
+    };
+    NSArray *steps = @[
+        @[@4.0, ^{ report(@"first page of the tab"); }],
+        @[@5.0, ^{ [self loadRequestInActiveTab:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.org/"]]]; }],
+        @[@10.0, ^{ report(@"after opening a second page"); }],
+        @[@11.0, ^{ printf("[BBACK] pressing Back\n"); [self browserRemoteInputControllerHandleMenuPress]; }],
+        @[@15.0, ^{ report(@"after Back"); }],
+        @[@16.0, ^{ [self.tabCoordinator createNewTabWithRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.net/"]]]; }],
+        @[@21.0, ^{ report(@"in a tab opened from the page"); }],
+        @[@22.0, ^{ printf("[BBACK] pressing Back\n"); [self browserRemoteInputControllerHandleMenuPress]; }],
+        @[@26.0, ^{ report(@"after Back in the opened tab"); }],
+    ];
+    for (NSArray *step in steps) {
+        void (^block)(void) = step[1];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([step[0] doubleValue] * NSEC_PER_SEC)), dispatch_get_main_queue(), block);
+    }
+}
+
 - (void)webViewDidFinishLoad:(id)webView {
     [self.tabCoordinator webViewDidFinishLoad:webView];
+    [self runBackDiagnosticsIfRequested];
+    [self runControlsWakeDiagnosticsIfRequested];
     [self runNavigationDiagnosticsIfRequested:webView];
     [self runPlayerControlsDiagnosticsIfRequested:webView];
     if (self.tabOverviewController.visible) {
@@ -1227,12 +1327,50 @@ static UIColor *kTextColor(void) {
 
 #pragma mark - Presses / Touches
 
+- (BOOL)pressesContainMenu:(NSSet<UIPress *> *)presses {
+    for (UIPress *press in presses) {
+        if (press.type == UIPressTypeMenu) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 - (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
     [self.remoteInputController handlePressesBegan:presses withEvent:event];
+    if ([self pressesContainMenu:presses]) {
+        // tvOS leaves the app as soon as an unhandled Back/Menu press reaches UIKit (at press
+        // *began*), so decide here whether the app handles it, and swallow it if so.
+        self.handlingMenuPress = [self appHandlesMenuPress];
+        if (self.handlingMenuPress) {
+            return;
+        }
+    }
     [super pressesBegan:presses withEvent:event];
 }
 
+- (void)pressesCancelled:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    if ([self pressesContainMenu:presses] && self.handlingMenuPress) {
+        self.handlingMenuPress = NO;
+        return;
+    }
+    [super pressesCancelled:presses withEvent:event];
+}
+
 - (void)pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    if ([self pressesContainMenu:presses]) {
+        BOOL handled = self.handlingMenuPress;
+        self.handlingMenuPress = NO;
+        if (!handled) {
+            // Nothing to go back to in the app: let tvOS go to the Home screen.
+            [super pressesEnded:presses withEvent:event];
+            return;
+        }
+        if (![self.remoteInputController handlePressesEnded:presses withEvent:event]) {
+            [self browserRemoteInputControllerHandleMenuPress];
+        }
+        return;
+    }
     // Home is focus-driven: let the focus engine own Select and the arrows there,
     // instead of the cursor/scroll handling (which would also open top-bar focus mode).
     if (self.tabCoordinator.showingHome && !self.topBarFocusActive && self.presentedViewController == nil) {

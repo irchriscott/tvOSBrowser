@@ -34,6 +34,14 @@ typedef NS_ENUM(NSInteger, BrowserPageNavigationResult) {
 /// outside of UIKit event handling.
 - (nullable NSValue *)activationPointInWebView:(BrowserWebView *)webView;
 
+/// Acts like a mouse moving over the page (at the highlight, or over the main video) so
+/// sites show hover UI such as auto-hiding video player controls. `videoOnScreen` is YES
+/// when a large video is visible.
+- (void)wakePageInWebView:(BrowserWebView *)webView completion:(nullable void (^)(BOOL videoOnScreen))completion;
+
+/// Play/Pause for the page's main video. Completion gets NO when there is no large video.
+- (void)togglePrimaryVideoInWebView:(BrowserWebView *)webView completion:(nullable void (^)(BOOL handled))completion;
+
 /// Removes the highlight (e.g. when switching back to cursor mode).
 - (void)clearInWebView:(nullable BrowserWebView *)webView;
 

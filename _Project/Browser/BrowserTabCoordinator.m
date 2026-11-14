@@ -415,6 +415,40 @@ static NSTimeInterval const kRepeatedCrashInterval = 30.0;
     return webView;
 }
 
+#pragma mark - Opener tabs
+
+- (NSInteger)indexOfTabWithIdentifier:(NSString *)identifier {
+    if (identifier.length == 0) {
+        return NSNotFound;
+    }
+    for (NSInteger index = 0; index < (NSInteger)self.viewModel.tabs.count; index++) {
+        BrowserTabViewModel *tab = self.viewModel.tabs[index];
+        if ([tab.identifier isEqualToString:identifier]) {
+            return index;
+        }
+    }
+    return NSNotFound;
+}
+
+- (BOOL)canReturnToOpenerTab {
+    BrowserTabViewModel *tab = self.activeTab;
+    return tab != nil && [self indexOfTabWithIdentifier:tab.openerIdentifier] != NSNotFound;
+}
+
+- (BOOL)returnToOpenerTab {
+    BrowserTabViewModel *tab = self.activeTab;
+    if (![self canReturnToOpenerTab]) {
+        return NO;
+    }
+    NSString *openerIdentifier = tab.openerIdentifier;
+    [self closeTabAtIndex:self.viewModel.activeTabIndex];
+    NSInteger openerIndex = [self indexOfTabWithIdentifier:openerIdentifier];
+    if (openerIndex != NSNotFound && openerIndex != self.viewModel.activeTabIndex) {
+        [self switchToTabAtIndex:openerIndex];
+    }
+    return YES;
+}
+
 #pragma mark - Page fullscreen
 
 - (void)setPageFullscreen:(BOOL)fullscreen forWebView:(id)webView {
@@ -659,7 +693,7 @@ static NSTimeInterval const kRepeatedCrashInterval = 30.0;
     if (tab.showingHome) {
         [self.topMenuView setHomeActive:YES];
         [self.topMenuView setDisplayedURLString:nil];
-        [self.topMenuView setBackEnabled:[self activeTabHasPageBehindHome] forwardEnabled:NO];
+        [self.topMenuView setBackEnabled:[self activeTabHasPageBehindHome] || [self canReturnToOpenerTab] forwardEnabled:NO];
         return;
     }
 
@@ -667,7 +701,7 @@ static NSTimeInterval const kRepeatedCrashInterval = 30.0;
     NSString *currentURL = tab.URLString.length > 0 ? tab.URLString : request.URL.absoluteString;
     [self.topMenuView setHomeActive:NO];
     [self.topMenuView setDisplayedURLString:currentURL];
-    [self.topMenuView setBackEnabled:self.activeWebView.canGoBack forwardEnabled:self.activeWebView.canGoForward];
+    [self.topMenuView setBackEnabled:self.activeWebView.canGoBack || [self canReturnToOpenerTab] forwardEnabled:self.activeWebView.canGoForward];
 
     if (request != nil) {
         [self.host browserTabCoordinatorUpdateTextFontSize];
@@ -933,13 +967,15 @@ static NSTimeInterval const kRepeatedCrashInterval = 30.0;
         return NO;
     }
 
-    [self captureSnapshotForTab:self.activeTab];
+    BrowserTabViewModel *openerTab = self.activeTab;
+    [self captureSnapshotForTab:openerTab];
     BrowserTabViewModel *tab = [self.viewModel addTab];
     if (tab == nil) {
         [self showMaxTabsAlert];
         return NO;
     }
     tab.showingHome = NO;
+    tab.openerIdentifier = openerTab.identifier;
 
     [self initWebView];
     [self refreshActiveTabUI];

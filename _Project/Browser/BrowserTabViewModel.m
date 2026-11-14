@@ -36,6 +36,12 @@
     self.title = title.length > 0 ? title : @"New Tab";
     self.URLString = URLString;
     self.showingHome = sessionRepresentation[@"showingHome"] ? [sessionRepresentation[@"showingHome"] boolValue] : URLString.length == 0;
+    NSString *openerIdentifier = sessionRepresentation[@"openerIdentifier"];
+    self.openerIdentifier = [openerIdentifier isKindOfClass:[NSString class]] && openerIdentifier.length > 0 ? openerIdentifier : nil;
+    NSString *identifier = sessionRepresentation[@"identifier"];
+    if ([identifier isKindOfClass:[NSString class]] && identifier.length > 0) {
+        _identifier = [identifier copy];
+    }
     if (scrollOffsetX != nil && scrollOffsetY != nil) {
         self.savedScrollOffset = CGPointMake(scrollOffsetX.doubleValue, scrollOffsetY.doubleValue);
         self.hasSavedScrollOffset = YES;
@@ -52,6 +58,10 @@
     representation[@"title"] = self.title ?: @"New Tab";
     representation[@"URLString"] = self.URLString ?: @"";
     representation[@"showingHome"] = @(self.showingHome);
+    representation[@"identifier"] = self.identifier ?: @"";
+    if (self.openerIdentifier.length > 0) {
+        representation[@"openerIdentifier"] = self.openerIdentifier;
+    }
     if (self.hasSavedScrollOffset) {
         representation[@"scrollOffsetX"] = @(self.savedScrollOffset.x);
         representation[@"scrollOffsetY"] = @(self.savedScrollOffset.y);

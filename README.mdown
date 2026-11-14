@@ -33,11 +33,13 @@ Improvements
 - **Persistent site data.** localStorage, IndexedDB, cookies and caches now survive app restarts. tvOS does not let apps write to WebKit's default location, so site data is kept in the app's Caches folder (tvOS may clear it if the device runs low on space).
 - **Fullscreen for web video.** tvOS WebKit has no fullscreen API and its native video fullscreen shows a black screen, so the browser provides the standard fullscreen API itself: a site's Fullscreen button stretches its player over the whole screen and hides the top bar, with the site's own controls, subtitles and menus still working. Press Menu to exit.
 - **Full screen player: Quality menu and position sync.** The native full screen player (enable it in the side menu) has a Quality menu in its transport bar (swipe down while playing): Auto, 4K, 1080p, 720p or 480p, remembered as your default. It starts where the page's video was and hands the position back when closed. Note that many 4K streams are HDR-only; Apple TV only picks them when the TV is in an HDR mode, so enable Settings > Video and Audio > Match Content (Dynamic Range) or set the format to 4K HDR.
-- **Hover support for the cursor.** Moving the cursor sends mouse-move events to the page, so hover UI such as auto-hiding video player controls appears as it would with a mouse.
+- **Hover support and video-friendly remote.** Moving the cursor (or just touching the surface) sends mouse-move events to the page, so hover UI such as auto-hiding video player controls appears as it would with a mouse; in navigation mode, arrow presses, touches and Select do the same. On a page with a large video, Play/Pause pauses and resumes it (other pages still open the Quick Menu).
 - **Media diagnostics mode** for debugging sites on a real Apple TV (see below).
 
 Bug fixes
 -------------
+- **Full screen player controls could not be brought back.** An old input hack swallowed Select, Play/Pause, left/right and swipes while the native player was open (turning Select into play/pause), so once its controls hid, clicking could not show them again. The player now gets the remote directly: click to show the controls, Play/Pause to toggle, left/right to skip, swipe to scrub, Menu to close.
+- **Back button leaving the app.** Every Back/Menu press reached tvOS, which leaves the app before the browser could go back. Back now steps back through the tab's history, closes a tab opened from a link and returns to the tab it came from, leaves Home, fullscreen, menus and the top bar, and only goes to the Apple TV Home screen when there is nothing left to go back to (replacing the old "Exit App?" prompt).
 - **Launch failure on newer SDKs.** Adopted the UIKit scene lifecycle ("UIScene life cycle is required for apps built with this SDK").
 - **App freezing when moving the cursor.** The link-hover check ran synchronous JavaScript inside every touch event, which nested UIKit events until the app was killed ("sendEvent: nesting level exceeded"). It now runs after each event, one check at a time, and JavaScript waits time out instead of hanging.
 - **Black pages after switching to scroll mode.** WebKit's page process crashes are now detected: the page reloads automatically and returns to its scroll position, and a "This page stopped responding" screen appears if it crashes again within 30 seconds. Scroll mode now uses only the app's own scrolling instead of scrolling every page twice.
@@ -64,8 +66,8 @@ Quick start:
 - Press the touch area while in cursor mode to click.
 - In navigation mode, click the edges of the touch surface (up/down/left/right) to move between links and buttons, press Select to open the highlighted one, and swipe to scroll.
 - Swipe up (or press up) to move into the top bar; on the Home page, simply move focus up from the tiles.
-- Single tap to Menu button to go back, or exit if it's root page. On the Home page it returns to the page you came from.
-- Single tap the Play/Pause button to show the Quick Menu, with: input URLs, search Google, reload the page, or go forward.
+- Press Back (Menu) to go back to the previous page in the tab. On the first page of a tab opened from a link, Back closes it and returns to the tab it came from; on the Home page it returns to the page you came from. When there is nothing left to go back to, Back goes to the Apple TV Home screen.
+- Single tap the Play/Pause button to pause/resume the video on video pages, or elsewhere to show the Quick Menu, with: input URLs, search Google, reload the page, or go forward.
 - Double tap the Play/Pause button to: display the full Side Menu, with: Favorites, History, open the Home page, change user agent, clear cache, and clear cookies and more.
 - On the Home page, press and hold Select on a pinned site or recently closed tab for more options.
 - On the Tabs page, press Play/Pause to close the focused tab.
@@ -93,5 +95,7 @@ Media Diagnostics
 To debug why a site misbehaves on a real Apple TV, launch the app with the argument `-BrowserMediaDiagnostics YES` (in Xcode: Edit Scheme > Run > Arguments). Lines prefixed with `[BDIAG]` are printed to the console with the page's media capabilities (MediaSource, native HLS, WebAssembly, JavaScript speed), video element state and events, network requests, script errors and a storage persistence check. Add `-savedURLtoReopen <url>` to open a page at launch, and `-BrowserMediaDiagnosticsAutoPlay YES` to try starting the page's video automatically. The diagnostics also check the ad blocker (a known ad script should be blocked while a control script loads).
 
 `-BrowserPlayerControlsDiagnostics YES -BrowserPlayerQualityDiagnostics YES` exercises a video page's player (settings, quality, fullscreen, Menu exit; add `-BrowserPlayerTestMode native` to test the full screen player's quality instead) and prints `[BQUAL]` lines.
+
+`-BrowserBackDiagnostics YES` checks what the Back button does on a tab's first page, after navigating, and in a tab opened from a page, printing `[BBACK]` lines.
 
 `-BrowserNavDiagnostics YES` runs a scripted sequence of remote arrow presses, a Select and a pop-up test on the first page that loads, printing `[BNAV]` lines with the element highlighted after each press.

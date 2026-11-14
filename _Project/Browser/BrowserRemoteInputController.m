@@ -413,9 +413,15 @@ static NSString *BrowserPressPhaseString(UIPressPhase phase) {
         return NO;
     }
     if (!self.cursorModeEnabled) {
+        // Navigation mode: a touch is still "activity" for the page (e.g. reveal player controls).
+        if ([self.host browserRemoteInputControllerPresentedViewController] == nil) {
+            [self.host browserRemoteInputControllerDidTouchSurfaceInNavigationMode];
+        }
         return NO;
     }
     self.lastTouchLocation = CGPointMake(-1, -1);
+    // A touch alone (without moving) also counts as mouse movement for the page.
+    [self scheduleHoverCheck];
     return YES;
 }
 

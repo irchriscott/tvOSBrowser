@@ -78,7 +78,16 @@ static UIViewController *BrowserFindViewControllerOfClass(UIViewController *view
     return nil;
 }
 
+/// The native full screen player is an AVPlayerViewController, which handles the remote itself:
+/// a click shows its controls, Play/Pause toggles, left/right skip, swipes scrub and Menu closes
+/// it. The old interception below (Select -> toggle, custom skip/scrub, Menu -> dismiss) swallowed
+/// those presses, so hidden controls could never be brought back. Kept, but switched off.
+static BOOL const kBrowserInterceptNativePlayerInput = NO;
+
 static UIViewController *BrowserFindPresentedNativeVideoPlayerViewController(UIApplication *application, Class nativeVideoPlayerClass) {
+    if (!kBrowserInterceptNativePlayerInput) {
+        return nil;
+    }
     for (UIWindow *window in application.windows) {
         if (window.hidden || window.rootViewController == nil) {
             continue;

@@ -12,6 +12,8 @@
 @property (nonatomic) BOOL hasSavedScrollOffset;
 @property (nonatomic) BOOL needsScrollRestore;
 @property (nonatomic) BOOL showingHome;
+/// The tab this one was opened from (link to a new tab); Back on its first page returns there.
+@property (nonatomic, copy) NSString *openerIdentifier;
 
 - (instancetype)initWithSessionRepresentation:(NSDictionary *)sessionRepresentation;
 - (NSDictionary *)sessionRepresentation;
