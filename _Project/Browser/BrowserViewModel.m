@@ -20,6 +20,10 @@ static NSUInteger const kMaximumTabCount = 5;
     return self;
 }
 
++ (NSUInteger)maximumTabCount {
+    return kMaximumTabCount;
+}
+
 - (BrowserTabViewModel *)activeTab {
     if (self.activeTabIndex == NSNotFound || self.activeTabIndex < 0 || self.activeTabIndex >= self.tabs.count) {
         return nil;

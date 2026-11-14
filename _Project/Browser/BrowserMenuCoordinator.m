@@ -507,7 +507,7 @@ withAnimationCoordinator:(UIFocusAnimationCoordinator *)coordinator {
     if (userAgent.length > 0) {
         [request setValue:userAgent forHTTPHeaderField:@"User-Agent"];
     }
-    [[self.host browserWebView] loadRequest:request];
+    [self.host browserLoadRequest:request];
 }
 
 - (void)saveFavoritesArray:(NSArray *)favorites {
@@ -1054,7 +1054,6 @@ withAnimationCoordinator:(UIFocusAnimationCoordinator *)coordinator {
         [BrowserAdvancedMenuSection sectionWithTitle:@"Navigation"
                                                items:@[
             [self homePageMenuItem],
-            [self setCurrentPageAsHomePageMenuItem],
             [self favoritesMenuItem],
             [self historyMenuItem],
             [self showTabsMenuItem],

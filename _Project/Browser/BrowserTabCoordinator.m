@@ -1,5 +1,7 @@
 #import "BrowserTabCoordinator.h"
 
+#import "BrowserHomeStore.h"
+#import "BrowserHomeView.h"
 #import "BrowserNavigationService.h"
 #import "BrowserPreferencesStore.h"
 #import "BrowserSessionStore.h"
@@ -9,8 +11,10 @@
 #import "BrowserWebView.h"
 
 static CGFloat const kThumbnailStagingOffset = 4096.0;
+/// A second crash within this window stops automatic reloading (avoids a crash loop).
+static NSTimeInterval const kRepeatedCrashInterval = 30.0;
 
-@interface BrowserTabCoordinator ()
+@interface BrowserTabCoordinator () <BrowserHomeViewDelegate>
 
 @property (nonatomic, weak) id<BrowserTabCoordinatorHost> host;
 @property (nonatomic) BrowserViewModel *viewModel;
@@ -27,6 +31,18 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
 @property (nonatomic) NSMutableDictionary<NSString *, BrowserWebView *> *webViewsByTabIdentifier;
 @property (nonatomic) UIView *thumbnailStagingView;
 @property (nonatomic, readwrite, nullable) BrowserWebView *activeWebView;
+@property (nonatomic, readwrite, nullable) BrowserHomeView *homeView;
+@property (nonatomic) BOOL hasNotifiedHomeVisibility;
+@property (nonatomic) BOOL lastNotifiedHomeVisible;
+@property (nonatomic) UIView *pageProgressView;
+@property (nonatomic) UIView *pageProgressFillView;
+@property (nonatomic) double pageProgressValue;
+/// Tabs whose page process died and still need a reload.
+@property (nonatomic) NSMutableSet<NSString *> *crashedTabIdentifiers;
+/// Tabs that crashed repeatedly and wait for the user to reload.
+@property (nonatomic) NSMutableSet<NSString *> *crashOverlayTabIdentifiers;
+@property (nonatomic) NSMutableDictionary<NSString *, NSDate *> *lastCrashDates;
+@property (nonatomic) UIView *crashOverlayView;
 
 @end
 
@@ -59,6 +75,9 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
         _webViewDelegate = webViewDelegate;
         _scrollViewAllowBounces = scrollViewAllowBounces;
         _webViewsByTabIdentifier = [NSMutableDictionary dictionary];
+        _crashedTabIdentifiers = [NSMutableSet set];
+        _crashOverlayTabIdentifiers = [NSMutableSet set];
+        _lastCrashDates = [NSMutableDictionary dictionary];
         [_preferencesStore ensureUserAgentConsistency];
         [self ensureThumbnailStagingView];
     }
@@ -67,6 +86,174 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
 
 - (BrowserTabViewModel *)activeTab {
     return [self.viewModel activeTab];
+}
+
+- (BOOL)showingHome {
+    return self.activeTab.showingHome;
+}
+
+#pragma mark - Home
+
+- (BrowserHomeView *)homeView {
+    if (_homeView == nil && self.browserContainerView != nil) {
+        _homeView = [[BrowserHomeView alloc] initWithFrame:self.rootView.bounds];
+        _homeView.delegate = self;
+        _homeView.hidden = YES;
+        [self.browserContainerView addSubview:_homeView];
+    }
+    return _homeView;
+}
+
+- (BOOL)activeTabHasPageBehindHome {
+    BrowserTabViewModel *tab = self.activeTab;
+    return self.activeWebView.request.URL.absoluteString.length > 0 || tab.URLString.length > 0;
+}
+
+- (void)updateHomeVisibility {
+    BrowserTabViewModel *tab = self.activeTab;
+    BOOL visible = tab != nil && tab.showingHome;
+
+    if (visible) {
+        BrowserHomeView *homeView = self.homeView;
+        BOOL becameVisible = homeView.hidden;
+        homeView.frame = self.rootView.bounds;
+        homeView.contentTopInset = self.topMenuBrowserOffset;
+        if (becameVisible) {
+            [homeView reloadData];
+            [self.activeWebView pauseAllMediaPlayback];
+        }
+        homeView.hidden = NO;
+        [self.browserContainerView bringSubviewToFront:homeView];
+    } else {
+        _homeView.hidden = YES;
+    }
+    // Keep the page out of the focus engine and off screen while Home covers it.
+    self.activeWebView.hidden = visible;
+    [self refreshActiveTabUI];
+    [self recoverActiveTabFromCrashIfNeeded];
+
+    if (!self.hasNotifiedHomeVisibility || self.lastNotifiedHomeVisible != visible) {
+        self.hasNotifiedHomeVisibility = YES;
+        self.lastNotifiedHomeVisible = visible;
+        [self.host browserTabCoordinatorHomeVisibilityChanged:visible];
+    }
+}
+
+- (void)reloadHome {
+    if (!self.showingHome) {
+        return;
+    }
+    [self.homeView reloadData];
+}
+
+- (void)showHomeForTab:(BrowserTabViewModel *)tab {
+    if (tab == nil) {
+        return;
+    }
+    tab.showingHome = YES;
+    if (tab == self.activeTab) {
+        [self updateHomeVisibility];
+    }
+}
+
+- (void)dismissHomeIfNeeded {
+    BrowserTabViewModel *tab = self.activeTab;
+    if (tab == nil || !tab.showingHome) {
+        return;
+    }
+    tab.showingHome = NO;
+    [self updateHomeVisibility];
+}
+
+- (BOOL)returnFromHomeToPage {
+    BrowserTabViewModel *tab = self.activeTab;
+    if (tab == nil || !tab.showingHome || ![self activeTabHasPageBehindHome]) {
+        return NO;
+    }
+    [self dismissHomeIfNeeded];
+    if (self.activeWebView.request == nil) {
+        [self loadStoredContentForTab:tab webView:self.activeWebView fallbackToHomePage:NO];
+    }
+    [self persistSession];
+    return YES;
+}
+
+- (void)openHomeItem:(BrowserHomeItem *)item inNewTab:(BOOL)inNewTab {
+    NSURLRequest *request = [self.navigationService requestForURLString:item.URLString];
+    if (request == nil) {
+        return;
+    }
+    if (item.kind == BrowserHomeItemKindRecentlyClosed) {
+        [BrowserHomeStore removeItem:item];
+    }
+    if (inNewTab) {
+        [self createNewTabWithRequest:request];
+        return;
+    }
+    [self dismissHomeIfNeeded];
+    [self.activeWebView loadRequest:request];
+    [self persistSession];
+}
+
+#pragma mark BrowserHomeViewDelegate
+
+- (void)homeView:(__unused BrowserHomeView *)homeView didSelectItem:(BrowserHomeItem *)item {
+    [self.host browserTabCoordinatorDidConsumeSelectPress];
+    [self openHomeItem:item inNewTab:NO];
+}
+
+- (void)homeViewDidSelectSearch:(__unused BrowserHomeView *)homeView {
+    [self.host browserTabCoordinatorDidConsumeSelectPress];
+    [self.host browserTabCoordinatorShowAddressEntry];
+}
+
+- (void)homeView:(__unused BrowserHomeView *)homeView didRequestOptionsForItem:(BrowserHomeItem *)item {
+    [self.host browserTabCoordinatorDidConsumeSelectPress];
+
+    UIAlertController *alertController = [UIAlertController alertControllerWithTitle:item.title
+                                                                             message:item.URLString
+                                                                      preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    [alertController addAction:[UIAlertAction actionWithTitle:@"Open"
+                                                        style:UIAlertActionStyleDefault
+                                                      handler:^(__unused UIAlertAction *action) {
+        [weakSelf openHomeItem:item inNewTab:NO];
+    }]];
+    [alertController addAction:[UIAlertAction actionWithTitle:@"Open in New Tab"
+                                                        style:UIAlertActionStyleDefault
+                                                      handler:^(__unused UIAlertAction *action) {
+        [weakSelf openHomeItem:item inNewTab:YES];
+    }]];
+
+    if (item.kind == BrowserHomeItemKindPinned) {
+        [alertController addAction:[UIAlertAction actionWithTitle:@"Remove from Pinned"
+                                                            style:UIAlertActionStyleDestructive
+                                                          handler:^(__unused UIAlertAction *action) {
+            [BrowserHomeStore removeItem:item];
+            [weakSelf reloadHome];
+        }]];
+    } else {
+        [alertController addAction:[UIAlertAction actionWithTitle:@"Pin to Home"
+                                                            style:UIAlertActionStyleDefault
+                                                          handler:^(__unused UIAlertAction *action) {
+            [BrowserHomeStore pinItem:item];
+            [weakSelf reloadHome];
+        }]];
+        [alertController addAction:[UIAlertAction actionWithTitle:@"Remove from Recently Closed"
+                                                            style:UIAlertActionStyleDestructive
+                                                          handler:^(__unused UIAlertAction *action) {
+            [BrowserHomeStore removeItem:item];
+            [weakSelf reloadHome];
+        }]];
+        [alertController addAction:[UIAlertAction actionWithTitle:@"Clear All Recently Closed"
+                                                            style:UIAlertActionStyleDestructive
+                                                          handler:^(__unused UIAlertAction *action) {
+            [BrowserHomeStore clearRecentlyClosed];
+            [weakSelf reloadHome];
+        }]];
+    }
+    [alertController addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self.host browserTabCoordinatorPresentViewController:alertController];
 }
 
 - (NSString *)requestURL {
@@ -97,9 +284,14 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
     self.viewModel.topNavigationBarVisible = visible;
     self.topMenuView.hidden = !visible;
     [self updateTopNavAndWebView];
+    [self updateLoadIndicatorsAnimated:NO];
 }
 
 - (void)updateTopNavAndWebView {
+    if (_homeView != nil) {
+        _homeView.frame = self.rootView.bounds;
+        _homeView.contentTopInset = self.topMenuBrowserOffset;
+    }
     if (self.activeWebView == nil) {
         return;
     }
@@ -110,6 +302,9 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
                                               self.rootView.bounds.size.height - self.topMenuBrowserOffset);
     } else {
         self.activeWebView.frame = self.rootView.bounds;
+    }
+    if (_crashOverlayView != nil) {
+        _crashOverlayView.frame = self.activeWebView.frame;
     }
 }
 
@@ -173,6 +368,7 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
     }
 
     [self updateThumbnailStagingViewFrame];
+    webView.hidden = NO;
     webView.userInteractionEnabled = NO;
     UIScrollView *scrollView = webView.scrollView;
     scrollView.scrollEnabled = NO;
@@ -216,16 +412,244 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
     return webView;
 }
 
+#pragma mark - Page process crashes
+
+- (void)forgetCrashStateForTabIdentifier:(NSString *)identifier {
+    if (identifier == nil) {
+        return;
+    }
+    [self.crashedTabIdentifiers removeObject:identifier];
+    [self.crashOverlayTabIdentifiers removeObject:identifier];
+    [self.lastCrashDates removeObjectForKey:identifier];
+}
+
+- (void)webViewContentProcessDidTerminate:(id)webView {
+    BrowserTabViewModel *tab = [self tabForWebView:webView];
+    if (tab == nil) {
+        return;
+    }
+
+    NSDate *now = [NSDate date];
+    NSDate *previousCrash = self.lastCrashDates[tab.identifier];
+    self.lastCrashDates[tab.identifier] = now;
+    [self.crashedTabIdentifiers addObject:tab.identifier];
+    // Re-apply the last saved position once the page comes back.
+    tab.needsScrollRestore = tab.hasSavedScrollOffset;
+
+    BOOL repeatedCrash = previousCrash != nil && [now timeIntervalSinceDate:previousCrash] < kRepeatedCrashInterval;
+    NSLog(@"[Browser] Web content process terminated for tab %@ (%@)%@", tab.identifier, tab.URLString, repeatedCrash ? @" - repeated, waiting for user" : @"");
+    if (repeatedCrash) {
+        [self.crashOverlayTabIdentifiers addObject:tab.identifier];
+    }
+
+    if (tab == self.activeTab) {
+        [self recoverActiveTabFromCrashIfNeeded];
+    }
+    // Background tabs (or a tab under Home) reload when they are shown again.
+}
+
+- (void)recoverActiveTabFromCrashIfNeeded {
+    BrowserTabViewModel *tab = self.activeTab;
+    [self updateCrashOverlay];
+    if (tab == nil || tab.showingHome ||
+        ![self.crashedTabIdentifiers containsObject:tab.identifier] ||
+        [self.crashOverlayTabIdentifiers containsObject:tab.identifier]) {
+        return;
+    }
+
+    // Deferred so a navigation the caller is about to start (e.g. opening a
+    // Home tile) wins instead of being replaced by this reload.
+    BrowserWebView *webView = self.activeWebView;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (tab != self.activeTab || tab.showingHome || webView != self.activeWebView || webView.isLoading ||
+            ![self.crashedTabIdentifiers containsObject:tab.identifier]) {
+            return;
+        }
+        [self reloadCrashedTab:tab webView:webView];
+    });
+}
+
+- (void)reloadCrashedTab:(BrowserTabViewModel *)tab webView:(BrowserWebView *)webView {
+    [self.crashedTabIdentifiers removeObject:tab.identifier];
+    [self.crashOverlayTabIdentifiers removeObject:tab.identifier];
+    [self updateCrashOverlay];
+    if (webView.request.URL != nil) {
+        [webView reload];
+    } else {
+        [self loadStoredContentForTab:tab webView:webView fallbackToHomePage:NO];
+    }
+}
+
+- (BOOL)reloadCrashedActiveTabIfNeeded {
+    BrowserTabViewModel *tab = self.activeTab;
+    if (tab == nil || tab.showingHome || ![self.crashOverlayTabIdentifiers containsObject:tab.identifier]) {
+        return NO;
+    }
+    [self reloadCrashedTab:tab webView:self.activeWebView];
+    return YES;
+}
+
+- (UIView *)makeCrashOverlayView {
+    UIView *overlay = [UIView new];
+    overlay.backgroundColor = [UIColor colorWithRed:0.07 green:0.07 blue:0.10 alpha:1.0];
+    overlay.userInteractionEnabled = NO;
+
+    UIImageSymbolConfiguration *configuration = [UIImageSymbolConfiguration configurationWithPointSize:84.0 weight:UIImageSymbolWeightLight];
+    UIImageView *iconView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"exclamationmark.triangle" withConfiguration:configuration]];
+    iconView.tintColor = [UIColor colorWithWhite:1.0 alpha:0.6];
+
+    UILabel *titleLabel = [UILabel new];
+    titleLabel.text = @"This page stopped responding";
+    titleLabel.font = [UIFont systemFontOfSize:48.0 weight:UIFontWeightBold];
+    titleLabel.textColor = UIColor.whiteColor;
+
+    UILabel *messageLabel = [UILabel new];
+    messageLabel.text = @"It crashed more than once, possibly because it uses more memory than Apple TV allows.\nPress Select or the reload button to try again.";
+    messageLabel.numberOfLines = 0;
+    messageLabel.textAlignment = NSTextAlignmentCenter;
+    messageLabel.font = [UIFont systemFontOfSize:28.0 weight:UIFontWeightRegular];
+    messageLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.6];
+
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[iconView, titleLabel, messageLabel]];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.alignment = UIStackViewAlignmentCenter;
+    stack.spacing = 24.0;
+    [overlay addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.centerXAnchor constraintEqualToAnchor:overlay.centerXAnchor],
+        [stack.centerYAnchor constraintEqualToAnchor:overlay.centerYAnchor],
+        [stack.widthAnchor constraintLessThanOrEqualToConstant:1200.0],
+    ]];
+    return overlay;
+}
+
+- (void)updateCrashOverlay {
+    BrowserTabViewModel *tab = self.activeTab;
+    BOOL visible = tab != nil && !tab.showingHome && [self.crashOverlayTabIdentifiers containsObject:tab.identifier];
+    if (!visible) {
+        self.crashOverlayView.hidden = YES;
+        return;
+    }
+    if (self.crashOverlayView == nil) {
+        self.crashOverlayView = [self makeCrashOverlayView];
+        [self.browserContainerView addSubview:self.crashOverlayView];
+    }
+    self.crashOverlayView.frame = self.activeWebView.frame;
+    self.crashOverlayView.hidden = NO;
+    [self.browserContainerView bringSubviewToFront:self.crashOverlayView];
+}
+
+#pragma mark - Load progress
+
+- (void)webView:(id)webView didChangeLoadProgress:(__unused double)progress loading:(__unused BOOL)loading {
+    if ([self tabForWebView:webView] == self.activeTab) {
+        [self updateLoadIndicatorsAnimated:YES];
+    }
+}
+
+- (void)updateLoadIndicatorsAnimated:(BOOL)animated {
+    BrowserTabViewModel *tab = self.activeTab;
+    BrowserWebView *webView = self.activeWebView;
+    BOOL loading = tab != nil && !tab.showingHome && webView.isLoading;
+    double progress = webView.estimatedProgress;
+    [self.topMenuView setLoadProgress:progress loading:loading animated:animated];
+    [self updatePageProgressViewWithProgress:progress loading:loading && !self.topNavigationVisible];
+}
+
+/// Slim progress line along the top of the screen, used while the top bar is hidden.
+- (void)ensurePageProgressView {
+    if (self.pageProgressView != nil || self.rootView == nil) {
+        return;
+    }
+    UIView *trackView = [UIView new];
+    trackView.userInteractionEnabled = NO;
+    trackView.clipsToBounds = YES;
+    trackView.hidden = YES;
+    trackView.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
+
+    UIView *fillView = [UIView new];
+    fillView.backgroundColor = [UIColor colorWithRed:0.23 green:0.57 blue:1.0 alpha:1.0];
+    [trackView addSubview:fillView];
+
+    if (self.browserContainerView.superview == self.rootView) {
+        [self.rootView insertSubview:trackView aboveSubview:self.browserContainerView];
+    } else {
+        [self.rootView addSubview:trackView];
+    }
+    self.pageProgressView = trackView;
+    self.pageProgressFillView = fillView;
+}
+
+- (void)updatePageProgressViewWithProgress:(double)progress loading:(BOOL)loading {
+    if (!loading && (self.pageProgressView == nil || self.pageProgressView.hidden)) {
+        return;
+    }
+    [self ensurePageProgressView];
+    UIView *trackView = self.pageProgressView;
+    CGFloat width = CGRectGetWidth(self.rootView.bounds);
+    trackView.frame = CGRectMake(0.0, 0.0, width, 6.0);
+
+    if (loading) {
+        BOOL wasHidden = trackView.hidden;
+        if (wasHidden) {
+            [trackView.layer removeAllAnimations];
+            [self.pageProgressFillView.layer removeAllAnimations];
+            self.pageProgressValue = 0.0;
+            self.pageProgressFillView.frame = CGRectMake(0.0, 0.0, 0.0, 6.0);
+            trackView.alpha = 1.0;
+            trackView.hidden = NO;
+        }
+        self.pageProgressValue = MAX(self.pageProgressValue, MAX(0.1, MIN(progress, 1.0)));
+        [UIView animateWithDuration:0.25 delay:0.0 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
+            self.pageProgressFillView.frame = CGRectMake(0.0, 0.0, round(width * self.pageProgressValue), 6.0);
+        } completion:nil];
+        [self.rootView bringSubviewToFront:self.cursorView];
+        return;
+    }
+
+    if (self.topNavigationVisible) {
+        // The address field shows progress now; drop the line immediately.
+        trackView.hidden = YES;
+        return;
+    }
+    self.pageProgressValue = 0.0;
+    [UIView animateWithDuration:0.2 animations:^{
+        self.pageProgressFillView.frame = CGRectMake(0.0, 0.0, width, 6.0);
+    } completion:^(__unused BOOL finished) {
+        [UIView animateWithDuration:0.3 animations:^{
+            trackView.alpha = 0.0;
+        } completion:^(__unused BOOL fadeFinished) {
+            if (self.pageProgressValue == 0.0) {
+                trackView.hidden = YES;
+                trackView.alpha = 1.0;
+            }
+        }];
+    }];
+}
+
 - (void)refreshActiveTabUI {
+    [self.topMenuView setTabCount:self.viewModel.tabs.count];
+    [self updateLoadIndicatorsAnimated:YES];
     BrowserTabViewModel *tab = self.activeTab;
     if (tab == nil) {
-        self.topMenuView.URLLabel.text = @"";
+        [self.topMenuView setDisplayedURLString:nil];
+        [self.topMenuView setBackEnabled:NO forwardEnabled:NO];
+        return;
+    }
+
+    if (tab.showingHome) {
+        [self.topMenuView setHomeActive:YES];
+        [self.topMenuView setDisplayedURLString:nil];
+        [self.topMenuView setBackEnabled:[self activeTabHasPageBehindHome] forwardEnabled:NO];
         return;
     }
 
     NSURLRequest *request = self.activeWebView.request;
     NSString *currentURL = tab.URLString.length > 0 ? tab.URLString : request.URL.absoluteString;
-    self.topMenuView.URLLabel.text = currentURL.length > 0 ? currentURL : @"New Tab";
+    [self.topMenuView setHomeActive:NO];
+    [self.topMenuView setDisplayedURLString:currentURL];
+    [self.topMenuView setBackEnabled:self.activeWebView.canGoBack forwardEnabled:self.activeWebView.canGoForward];
 
     if (request != nil) {
         [self.host browserTabCoordinatorUpdateTextFontSize];
@@ -237,6 +661,7 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
 }
 
 - (void)restoreInitialStateOrCreateFirstTab {
+    [BrowserHomeStore seedDefaultPinnedSitesIfNeeded];
     self.topMenuView.hidden = !self.viewModel.topNavigationBarVisible;
     if (![self restoreBrowserSession]) {
         [self createNewTabLoadingHomePage:NO];
@@ -249,17 +674,24 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
 - (void)webViewDidAppear {
     NSURLRequest *savedReopenRequest = [self.sessionStore consumeSavedURLToReopenRequestWithNavigationService:self.navigationService];
     if (savedReopenRequest != nil) {
+        [self dismissHomeIfNeeded];
         [self.activeWebView loadRequest:savedReopenRequest];
+    } else if (self.showingHome) {
+        [self updateHomeVisibility];
     } else if (self.activeWebView.request == nil) {
         [self loadStoredContentForTab:self.activeTab webView:self.activeWebView fallbackToHomePage:YES];
     }
 }
 
 - (void)loadHomePage {
-    NSURLRequest *homePageRequest = [self.navigationService homePageRequest];
-    if (homePageRequest != nil) {
-        [self.activeWebView loadRequest:homePageRequest];
+    BrowserTabViewModel *tab = self.activeTab;
+    if (tab == nil) {
+        return;
     }
+    [self captureSnapshotForTab:tab];
+    [self showHomeForTab:tab];
+    [self reloadHome];
+    [self persistSession];
 }
 
 - (void)initWebView {
@@ -300,7 +732,6 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
     }
 
     self.activeWebView = activeWebView;
-    [self.topMenuView.loadingSpinner stopAnimating];
     [self.activeWebView removeFromSuperview];
     [self.browserContainerView addSubview:self.activeWebView];
     [self updateTopNavAndWebView];
@@ -312,17 +743,20 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
     [self.rootView layoutIfNeeded];
     scrollView.bounces = self.scrollViewAllowBounces;
 
-    BOOL shouldAllowWebInteraction = ![self.host browserTabCoordinatorIsCursorModeEnabled] &&
+    BOOL scrollModeActive = ![self.host browserTabCoordinatorIsCursorModeEnabled] &&
         ![self.host browserTabCoordinatorIsTabOverviewVisible];
-    scrollView.scrollEnabled = shouldAllowWebInteraction;
-    self.activeWebView.userInteractionEnabled = shouldAllowWebInteraction;
-    self.manualScrollPanRecognizer.enabled = shouldAllowWebInteraction;
+    // The app scrolls pages itself (manual pan + inertia); WebKit never gets remote touches.
+    scrollView.scrollEnabled = NO;
+    self.activeWebView.userInteractionEnabled = NO;
+    self.manualScrollPanRecognizer.enabled = scrollModeActive;
 
     [self refreshActiveTabUI];
+    [self updateHomeVisibility];
 }
 
 - (void)updateStoredScrollOffsetForTab:(BrowserTabViewModel *)tab {
-    if (tab == nil) {
+    // While a restore is pending (or the page crashed) the live offset is meaningless; keep the saved one.
+    if (tab == nil || tab.needsScrollRestore || [self.crashedTabIdentifiers containsObject:tab.identifier]) {
         return;
     }
 
@@ -346,29 +780,16 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
 - (void)loadStoredContentForTab:(BrowserTabViewModel *)tab
                         webView:(BrowserWebView *)webView
              fallbackToHomePage:(BOOL)fallbackToHomePage {
-    if (webView == nil) {
+    if (tab == nil || tab.showingHome || webView == nil) {
         return;
     }
 
     NSString *URLString = tab.URLString.length > 0 ? tab.URLString : tab.requestURL;
-    if (URLString.length == 0) {
-        if (fallbackToHomePage) {
-            NSURLRequest *homePageRequest = [self.navigationService homePageRequest];
-            if (homePageRequest != nil) {
-                [webView loadRequest:homePageRequest];
-            }
-        }
-        return;
-    }
-
-    NSURLRequest *request = [self.navigationService requestForURLString:URLString];
+    NSURLRequest *request = URLString.length > 0 ? [self.navigationService requestForURLString:URLString] : nil;
     if (request != nil) {
         [webView loadRequest:request];
     } else if (fallbackToHomePage) {
-        NSURLRequest *homePageRequest = [self.navigationService homePageRequest];
-        if (homePageRequest != nil) {
-            [webView loadRequest:homePageRequest];
-        }
+        [self showHomeForTab:tab];
     }
 }
 
@@ -403,8 +824,20 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
         [self updateStoredScrollOffsetForTab:tab];
     }
 
+    if (tab.showingHome) {
+        // The page behind Home is not what the user sees; keep the Home snapshot instead.
+        if (tab == self.activeTab && _homeView != nil && !_homeView.hidden) {
+            UIImage *homeSnapshot = [_homeView snapshotImage];
+            if (homeSnapshot != nil) {
+                tab.snapshotImage = homeSnapshot;
+            }
+        }
+        return;
+    }
+
     BrowserWebView *webView = self.webViewsByTabIdentifier[tab.identifier];
-    if (webView == nil || CGRectIsEmpty(webView.bounds)) {
+    if (webView == nil || CGRectIsEmpty(webView.bounds) || [self.crashedTabIdentifiers containsObject:tab.identifier]) {
+        // A crashed page renders black; keep the last good thumbnail.
         return;
     }
 
@@ -482,10 +915,12 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
     }
 
     [self captureSnapshotForTab:self.activeTab];
-    if ([self.viewModel addTab] == nil) {
+    BrowserTabViewModel *tab = [self.viewModel addTab];
+    if (tab == nil) {
         [self showMaxTabsAlert];
         return NO;
     }
+    tab.showingHome = NO;
 
     [self initWebView];
     [self refreshActiveTabUI];
@@ -519,8 +954,12 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
 
     BOOL closingActiveTab = tabIndex == self.viewModel.activeTabIndex;
     BrowserTabViewModel *tab = self.viewModel.tabs[tabIndex];
+    NSString *closedURL = tab.URLString.length > 0 ? tab.URLString : tab.requestURL;
+    NSString *closedTitle = [tab.title isEqualToString:@"New Tab"] ? nil : tab.title;
+    [BrowserHomeStore recordClosedTabWithURLString:closedURL title:closedTitle];
     [self.webViewsByTabIdentifier[tab.identifier] removeFromSuperview];
     [self.webViewsByTabIdentifier removeObjectForKey:tab.identifier];
+    [self forgetCrashStateForTabIdentifier:tab.identifier];
     [self.viewModel removeTabAtIndex:tabIndex];
 
     if (self.viewModel.tabs.count == 0) {
@@ -536,6 +975,7 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
     }
 
     [self refreshActiveTabUI];
+    [self reloadHome];
     [self persistSession];
 }
 
@@ -625,20 +1065,21 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
         return;
     }
 
-    if (tab == self.activeTab && ![tab.previousURL isEqualToString:tab.requestURL]) {
-        [self.topMenuView.loadingSpinner startAnimating];
-    }
     tab.previousURL = tab.requestURL;
+    [self.crashedTabIdentifiers removeObject:tab.identifier];
+    if ([self.crashOverlayTabIdentifiers containsObject:tab.identifier]) {
+        [self.crashOverlayTabIdentifiers removeObject:tab.identifier];
+        [self updateCrashOverlay];
+    }
+    if (tab == self.activeTab) {
+        [self updateLoadIndicatorsAnimated:YES];
+    }
 }
 
 - (void)webViewDidFinishLoad:(id)webView {
     BrowserTabViewModel *tab = [self tabForWebView:webView];
     if (tab == nil) {
         return;
-    }
-
-    if (tab == self.activeTab) {
-        [self.topMenuView.loadingSpinner stopAnimating];
     }
 
     NSString *theTitle = [webView stringByEvaluatingJavaScriptFromString:@"document.title"];
@@ -648,7 +1089,8 @@ static CGFloat const kThumbnailStagingOffset = 4096.0;
 
     if (tab == self.activeTab) {
         [self refreshActiveTabUI];
-    } else if ([self isWebViewStaged:webView]) {
+    }
+    if ((tab != self.activeTab && [self isWebViewStaged:webView]) || tab.showingHome) {
         [webView pauseAllMediaPlayback];
     }
     [self restoreSavedScrollOffsetForTab:tab webView:webView];

@@ -13,6 +13,7 @@
         _savedScrollOffset = CGPointZero;
         _hasSavedScrollOffset = NO;
         _needsScrollRestore = NO;
+        _showingHome = YES;
     }
     return self;
 }
@@ -34,6 +35,7 @@
     self.previousURL = previousURL;
     self.title = title.length > 0 ? title : @"New Tab";
     self.URLString = URLString;
+    self.showingHome = sessionRepresentation[@"showingHome"] ? [sessionRepresentation[@"showingHome"] boolValue] : URLString.length == 0;
     if (scrollOffsetX != nil && scrollOffsetY != nil) {
         self.savedScrollOffset = CGPointMake(scrollOffsetX.doubleValue, scrollOffsetY.doubleValue);
         self.hasSavedScrollOffset = YES;
@@ -49,6 +51,7 @@
     representation[@"previousURL"] = self.previousURL ?: @"";
     representation[@"title"] = self.title ?: @"New Tab";
     representation[@"URLString"] = self.URLString ?: @"";
+    representation[@"showingHome"] = @(self.showingHome);
     if (self.hasSavedScrollOffset) {
         representation[@"scrollOffsetX"] = @(self.savedScrollOffset.x);
         representation[@"scrollOffsetY"] = @(self.savedScrollOffset.y);

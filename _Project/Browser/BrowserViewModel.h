@@ -11,6 +11,7 @@
 @property (nonatomic) NSUInteger textFontSize;
 @property (nonatomic) BOOL fullscreenVideoPlaybackEnabled;
 
++ (NSUInteger)maximumTabCount;
 - (BrowserTabViewModel *)activeTab;
 - (BrowserTabViewModel *)addTab;
 - (BrowserTabViewModel *)ensureActiveTab;

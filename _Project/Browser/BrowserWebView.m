@@ -31,12 +31,18 @@ static void BrowserEnsureWebKitRuntimeLoaded(void) {
     });
 }
 
-static void BrowserPumpRunLoopUntil(BOOL *done) {
-    while (!*done) {
+static void BrowserPumpRunLoopUntilWithTimeout(BOOL *done, NSTimeInterval timeout) {
+    // Bounded so a crashed or unresponsive web content process can't freeze the UI.
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (!*done && [deadline timeIntervalSinceNow] > 0) {
         @autoreleasepool {
             [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
         }
     }
+}
+
+static void BrowserPumpRunLoopUntil(BOOL *done) {
+    BrowserPumpRunLoopUntilWithTimeout(done, 2.0);
 }
 
 static NSString *BrowserStringFromJavaScriptResult(id result) {
@@ -483,6 +489,345 @@ static void BrowserInstallYouTubeCaptureUserScript(id configuration) {
     }
 }
 
+#pragma mark - Website data storage
+
+/// tvOS apps may not write to Library (outside Caches), so WebKit's default
+/// persistent store cannot create its folders and silently keeps localStorage,
+/// IndexedDB, service workers, etc. in memory only. Put all of it under
+/// Caches instead. (tvOS can purge Caches when the device runs low on space,
+/// so this is "persistent unless the system needs the room".)
+static NSURL *BrowserWebsiteDataDirectoryURL(void) {
+    NSURL *cachesURL = [[NSFileManager defaultManager] URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
+    return [cachesURL URLByAppendingPathComponent:@"BrowserWebsiteData" isDirectory:YES];
+}
+
+static void BrowserSetURLIfAvailable(id target, NSString *selectorName, NSURL *URL) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (URL != nil && [target respondsToSelector:selector]) {
+        [[NSFileManager defaultManager] createDirectoryAtURL:URL withIntermediateDirectories:YES attributes:nil error:nil];
+        ((void (*)(id, SEL, id))objc_msgSend)(target, selector, URL);
+    }
+}
+
+static id BrowserMakeCachesBackedDataStoreConfiguration(NSURL *rootURL) {
+    Class configurationClass = NSClassFromString(@"_WKWebsiteDataStoreConfiguration");
+    if (configurationClass == Nil) {
+        return nil;
+    }
+
+    id configuration = nil;
+    SEL initWithDirectory = NSSelectorFromString(@"initWithDirectory:");
+    if ([configurationClass instancesRespondToSelector:initWithDirectory]) {
+        // Newer WebKit: one root folder for every kind of site data.
+        configuration = ((id (*)(id, SEL))objc_msgSend)((id)configurationClass, @selector(alloc));
+        configuration = ((id (*)(id, SEL, id))objc_msgSend)(configuration, initWithDirectory, rootURL);
+    }
+    if (configuration == nil) {
+        configuration = ((id (*)(id, SEL))objc_msgSend)((id)configurationClass, @selector(new));
+    }
+
+    // Set the individual folders as well, so nothing falls back to Library on
+    // WebKit builds where the root folder does not cover every store.
+    NSDictionary<NSString *, NSString *> *subdirectories = @{
+        @"setGeneralStorageDirectory:": @"General",
+        @"_setWebStorageDirectory:": @"LocalStorage",
+        @"_setIndexedDBDatabaseDirectory:": @"IndexedDB",
+        @"_setWebSQLDatabaseDirectory:": @"WebSQL",
+        @"_setCacheStorageDirectory:": @"CacheStorage",
+        @"_setServiceWorkerRegistrationDirectory:": @"ServiceWorkers",
+        @"_setResourceLoadStatisticsDirectory:": @"ResourceLoadStatistics",
+        @"_setResourceMonitorThrottlerDirectory:": @"ResourceMonitorThrottler",
+        @"setNetworkCacheDirectory:": @"NetworkCache",
+        @"setMediaCacheDirectory:": @"MediaCache",
+        @"setMediaKeysStorageDirectory:": @"MediaKeys",
+        @"setDeviceIdHashSaltsStorageDirectory:": @"DeviceIdHashSalts",
+        @"setHSTSStorageDirectory:": @"HSTS",
+        @"setAlternativeServicesStorageDirectory:": @"AlternativeServices",
+        @"setSearchFieldHistoryDirectory:": @"SearchHistory",
+        @"setApplicationCacheDirectory:": @"ApplicationCache",
+    };
+    [subdirectories enumerateKeysAndObjectsUsingBlock:^(NSString *selectorName, NSString *name, __unused BOOL *stop) {
+        BrowserSetURLIfAvailable(configuration, selectorName, [rootURL URLByAppendingPathComponent:name isDirectory:YES]);
+    }];
+    return configuration;
+}
+
+/// One store for every tab (shared cookies, storage and network process).
+static id BrowserSharedWebsiteDataStore(void) {
+    static id dataStore;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        BrowserEnsureWebKitRuntimeLoaded();
+        Class dataStoreClass = NSClassFromString(kBrowserWebsiteDataStoreClassName);
+        if (dataStoreClass == Nil) {
+            return;
+        }
+
+        NSURL *rootURL = BrowserWebsiteDataDirectoryURL();
+        [[NSFileManager defaultManager] createDirectoryAtURL:rootURL withIntermediateDirectories:YES attributes:nil error:nil];
+        id configuration = BrowserMakeCachesBackedDataStoreConfiguration(rootURL);
+        SEL initWithConfiguration = NSSelectorFromString(@"_initWithConfiguration:");
+        if (configuration != nil && [dataStoreClass instancesRespondToSelector:initWithConfiguration]) {
+            id store = ((id (*)(id, SEL))objc_msgSend)((id)dataStoreClass, @selector(alloc));
+            dataStore = ((id (*)(id, SEL, id))objc_msgSend)(store, initWithConfiguration, configuration);
+        }
+        if (dataStore != nil) {
+            NSLog(@"[Browser] Website data stored in %@", rootURL.path);
+            return;
+        }
+
+        SEL defaultDataStore = NSSelectorFromString(@"defaultDataStore");
+        if ([dataStoreClass respondsToSelector:defaultDataStore]) {
+            NSLog(@"[Browser] Custom website data store unavailable; using WebKit's default store");
+            dataStore = ((id (*)(id, SEL))objc_msgSend)((id)dataStoreClass, defaultDataStore);
+        }
+    });
+    return dataStore;
+}
+
+static void *BrowserWebViewProgressObservationContext = &BrowserWebViewProgressObservationContext;
+
+#pragma mark - Cross-origin HLS fix
+
+/// tvOS WebKit has no MediaSource, so players like hls.js fall back to handing
+/// the .m3u8 straight to <video>. A plain <video> request carries no Origin
+/// header, and many HLS hosts answer 404 without one (they expect hls.js'
+/// CORS fetches). Loading the media in CORS mode (crossorigin="anonymous")
+/// makes WebKit send Origin. If a server turns out not to allow CORS, the
+/// element is retried once without it.
+static NSString *BrowserCrossOriginHLSScript(void) {
+    return @"(function(){"
+        "if (window.__browserHLSCORSInstalled || !window.HTMLMediaElement) { return; }"
+        "window.__browserHLSCORSInstalled = true;"
+        "function needsCORS(element, value) {"
+            "if (!element || element.hasAttribute('crossorigin') || element.__browserCORSRetried) { return false; }"
+            "try {"
+                "var url = new URL(String(value), document.baseURI);"
+                "if (url.protocol !== 'https:' && url.protocol !== 'http:') { return false; }"
+                "if (url.origin === location.origin) { return false; }"
+                "return /\\.m3u8$/i.test(url.pathname) || /[?&](format|type)=m3u8/i.test(url.search);"
+            "} catch (error) { return false; }"
+        "}"
+        "function prepare(element, value) {"
+            "if (needsCORS(element, value)) {"
+                "element.crossOrigin = 'anonymous';"
+                "element.__browserAddedCORS = true;"
+            "}"
+        "}"
+        "var descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');"
+        "if (descriptor && descriptor.set) {"
+            "Object.defineProperty(HTMLMediaElement.prototype, 'src', {"
+                "configurable: true, enumerable: descriptor.enumerable, get: descriptor.get,"
+                "set: function(value) { prepare(this, value); return descriptor.set.call(this, value); }"
+            "});"
+        "}"
+        "var originalSetAttribute = Element.prototype.setAttribute;"
+        "Element.prototype.setAttribute = function(name, value) {"
+            "if (this instanceof HTMLMediaElement && String(name).toLowerCase() === 'src') { prepare(this, value); }"
+            "else if (this instanceof HTMLSourceElement && String(name).toLowerCase() === 'src' && this.parentElement instanceof HTMLMediaElement) { prepare(this.parentElement, value); }"
+            "return originalSetAttribute.apply(this, arguments);"
+        "};"
+        "document.addEventListener('error', function(event) {"
+            "var element = event.target;"
+            "if (!(element instanceof HTMLMediaElement) || !element.__browserAddedCORS || !element.error) { return; }"
+            "element.__browserAddedCORS = false;"
+            "element.__browserCORSRetried = true;"
+            "element.removeAttribute('crossorigin');"
+            "try { element.load(); } catch (error) {}"
+        "}, true);"
+    "})();";
+}
+
+static void BrowserInstallCrossOriginHLSUserScript(id configuration) {
+    Class userScriptClass = NSClassFromString(kBrowserUserScriptClassName);
+    SEL userContentControllerGetter = NSSelectorFromString(@"userContentController");
+    SEL userScriptInitializer = NSSelectorFromString(@"initWithSource:injectionTime:forMainFrameOnly:");
+    if (configuration == nil || userScriptClass == Nil || ![configuration respondsToSelector:userContentControllerGetter] ||
+        ![userScriptClass instancesRespondToSelector:userScriptInitializer]) {
+        return;
+    }
+    id userContentController = ((id (*)(id, SEL))objc_msgSend)(configuration, userContentControllerGetter);
+    id userScript = ((id (*)(id, SEL))objc_msgSend)((id)userScriptClass, @selector(alloc));
+    // Document start, all frames: embedded players live in iframes too.
+    userScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(userScript, userScriptInitializer, BrowserCrossOriginHLSScript(), 0, NO);
+    if (userContentController != nil && userScript != nil) {
+        ((void (*)(id, SEL, id))objc_msgSend)(userContentController, NSSelectorFromString(@"addUserScript:"), userScript);
+    }
+}
+
+#pragma mark - Media diagnostics (launch with -BrowserMediaDiagnostics YES)
+
+static BOOL BrowserMediaDiagnosticsEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"BrowserMediaDiagnostics"];
+}
+
+static void BrowserDiagPrint(NSString *message) {
+    // stdout so `devicectl device process launch --console` shows it.
+    printf("[BDIAG] %s\n", message.UTF8String);
+    fflush(stdout);
+}
+
+static NSString *BrowserMediaDiagnosticsHookScript(void) {
+    return @"(function(){"
+        "if (window.__bdiag) { return; }"
+        "var D = window.__bdiag = { events: [], t0: Date.now() };"
+        "function log(kind, msg) {"
+            "D.events.push(((Date.now() - D.t0) / 1000).toFixed(1) + 's ' + kind + ' ' + String(msg).slice(0, 220));"
+            "if (D.events.length > 400) { D.events.shift(); }"
+        "}"
+        "D.log = log;"
+        "window.addEventListener('error', function(e) { log('js-error', (e.message || (e.target && e.target.src) || '') + ' @' + (e.filename || '') + ':' + (e.lineno || '')); }, true);"
+        "window.addEventListener('unhandledrejection', function(e) { var r = e.reason; log('rejection', r && (r.stack || r.message) || r); });"
+        "var origError = console.error; console.error = function() { try { log('console.error', Array.prototype.map.call(arguments, String).join(' ')); } catch (x) {} return origError.apply(console, arguments); };"
+        "var origWarn = console.warn; console.warn = function() { try { log('console.warn', Array.prototype.map.call(arguments, String).join(' ')); } catch (x) {} return origWarn.apply(console, arguments); };"
+        "['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','playing','waiting','stalled','error','emptied','abort','pause','play','seeking','ended'].forEach(function(name) {"
+            "document.addEventListener(name, function(e) {"
+                "var t = e.target; if (!t || t.tagName !== 'VIDEO') { return; }"
+                "log('video:' + name, 'src=' + String(t.currentSrc || t.src || '').slice(0, 90) + ' rs=' + t.readyState + ' ns=' + t.networkState + ' t=' + (t.currentTime || 0).toFixed(1) + (t.error ? ' ERR=' + t.error.code + ' ' + (t.error.message || '') : ''));"
+            "}, true);"
+        "});"
+        "function interesting(u) { return !/\\.(css|png|jpe?g|gif|svg|webp|woff2?)(\\?|$)|\\/_app\\/immutable\\//i.test(u); }"
+        "if (window.fetch) {"
+            "var origFetch = window.fetch;"
+            "window.fetch = function(input, init) {"
+                "var url = String(input && input.url || input); var start = Date.now();"
+                "var p = origFetch.apply(this, arguments);"
+                "if (interesting(url)) {"
+                    "p.then(function(r) { log('fetch', r.status + ' ' + (Date.now() - start) + 'ms ' + url.slice(0, 140)); },"
+                    "function(err) { log('fetch-FAIL', (Date.now() - start) + 'ms ' + url.slice(0, 140) + ' ' + err); });"
+                "}"
+                "return p;"
+            "};"
+        "}"
+        "var origOpen = XMLHttpRequest.prototype.open;"
+        "XMLHttpRequest.prototype.open = function(method, url) { this.__bdiagURL = String(url); this.__bdiagStart = Date.now(); return origOpen.apply(this, arguments); };"
+        "var origSend = XMLHttpRequest.prototype.send;"
+        "XMLHttpRequest.prototype.send = function() {"
+            "var xhr = this;"
+            "if (interesting(xhr.__bdiagURL || '')) {"
+                "xhr.addEventListener('loadend', function() { log('xhr', xhr.status + ' ' + (Date.now() - xhr.__bdiagStart) + 'ms ' + String(xhr.__bdiagURL).slice(0, 140)); });"
+            "}"
+            "return origSend.apply(this, arguments);"
+        "};"
+    "})();";
+}
+
+static NSString *BrowserMediaDiagnosticsCapabilityScript(void) {
+    return @"(function(){"
+        "var D = window.__bdiag || {};"
+        "var out = {};"
+        "out.ua = navigator.userAgent;"
+        "out.webAssembly = typeof WebAssembly;"
+        "try { out.wasmValidate = WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0])); } catch (e) { out.wasmValidate = 'ERR ' + e; }"
+        "out.mediaSource = typeof MediaSource;"
+        "out.managedMediaSource = typeof ManagedMediaSource;"
+        "var avc = 'video/mp4; codecs=\"avc1.640028,mp4a.40.2\"';"
+        "try { out.mseAvc = window.MediaSource ? MediaSource.isTypeSupported(avc) : 'n/a'; } catch (e) { out.mseAvc = 'ERR ' + e; }"
+        "try { out.mmsAvc = window.ManagedMediaSource ? ManagedMediaSource.isTypeSupported(avc) : 'n/a'; } catch (e) { out.mmsAvc = 'ERR ' + e; }"
+        "out.nativeHLS = document.createElement('video').canPlayType('application/vnd.apple.mpegurl');"
+        "var t = performance.now(); var acc = 0; for (var i = 0; i < 5000000; i++) { acc = (acc + i * 7) % 1000003; } out.loop5M_ms = Math.round(performance.now() - t);"
+        "if (!D.wasmTestStarted && window.WebAssembly) {"
+            "D.wasmTestStarted = true;"
+            "var start = Date.now();"
+            "fetch('https://api2.wing.st/crush.wasm').then(function(r) { return r.arrayBuffer(); }).then(function(b) {"
+                "var fetched = Date.now(); D.log && D.log('wasm-test', 'fetched ' + b.byteLength + ' bytes in ' + (fetched - start) + 'ms');"
+                "return WebAssembly.compile(b).then(function() { D.log && D.log('wasm-test', 'compiled in ' + (Date.now() - fetched) + 'ms'); });"
+            "}).catch(function(e) { D.log && D.log('wasm-test', 'FAILED ' + e); });"
+        "}"
+        "out.cookiePrevious = (document.cookie.match(/__bdiag_c=([^;]*)/) || [])[1] || null;"
+        "document.cookie = '__bdiag_c=' + Date.now() + '; max-age=31536000; path=/; secure; samesite=lax';"
+        "try { out.localStoragePrevious = localStorage.getItem('__bdiag_ls'); localStorage.setItem('__bdiag_ls', new Date().toISOString()); out.localStorageWrite = 'ok'; } catch (e) { out.localStorageWrite = 'ERR ' + e; }"
+        "try {"
+            "var req = indexedDB.open('__bdiag_db', 1);"
+            "req.onupgradeneeded = function() { req.result.createObjectStore('kv'); };"
+            "req.onerror = function() { D.log && D.log('idb', 'open FAILED ' + req.error); };"
+            "req.onsuccess = function() {"
+                "var db = req.result; var tx = db.transaction('kv', 'readwrite'); var store = tx.objectStore('kv');"
+                "var get = store.get('stamp');"
+                "get.onsuccess = function() { D.log && D.log('idb', 'previous=' + get.result); store.put(new Date().toISOString(), 'stamp'); };"
+                "tx.oncomplete = function() { D.log && D.log('idb', 'write ok'); };"
+                "tx.onerror = function() { D.log && D.log('idb', 'write FAILED ' + tx.error); };"
+            "};"
+        "} catch (e) { out.indexedDB = 'ERR ' + e; }"
+        "return JSON.stringify(out);"
+    "})()";
+}
+
+static NSString *BrowserMediaDiagnosticsReportScript(void) {
+    return @"(function(){"
+        "var D = window.__bdiag || { events: [] };"
+        "var videos = Array.prototype.map.call(document.querySelectorAll('video'), function(v) {"
+            "var b = []; try { for (var i = 0; i < v.buffered.length; i++) { b.push(v.buffered.start(i).toFixed(1) + '-' + v.buffered.end(i).toFixed(1)); } } catch (e) {}"
+            "return { src: String(v.currentSrc || v.src || '').slice(0, 90), rs: v.readyState, ns: v.networkState, paused: v.paused, t: +(v.currentTime || 0).toFixed(1), dur: v.duration, err: v.error ? v.error.code + ' ' + (v.error.message || '') : null, trackElements: v.querySelectorAll('track').length, textTracks: v.textTracks ? v.textTracks.length : -1, buffered: b.join(','), muted: v.muted, autoplay: v.autoplay, crossOrigin: v.crossOrigin, corsRetried: !!v.__browserCORSRetried };"
+        "});"
+        "var events = (D.events || []).splice(0);"
+        "return JSON.stringify({ url: location.href.slice(0, 80), videos: videos, iframes: document.querySelectorAll('iframe').length, events: events });"
+    "})()";
+}
+
+static NSString *BrowserMediaDiagnosticsAutoPlayScript(void) {
+    return @"(function(){"
+        "var D = window.__bdiag || {}; var log = D.log || function(){};"
+        "var v = document.querySelector('video'); if (!v) { return 'no video'; }"
+        "var r = v.getBoundingClientRect(); var el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);"
+        "log('autoplay', 'clicking ' + (el ? el.tagName + '.' + String(el.className).slice(0, 40) : 'nothing') + ' then video.play()');"
+        "try { if (el) { el.click(); } } catch (e) { log('autoplay', 'click error ' + e); }"
+        "try { var p = v.play(); if (p && p.then) { p.then(function() { log('autoplay', 'play() resolved'); }, function(e) { log('autoplay', 'play() rejected ' + e); }); } } catch (e) { log('autoplay', 'play() threw ' + e); }"
+        "return 'ok';"
+    "})()";
+}
+
+static void BrowserDiagPrintMethods(NSString *className, NSArray<NSString *> *needles) {
+    Class cls = NSClassFromString(className);
+    if (cls == Nil) {
+        BrowserDiagPrint([NSString stringWithFormat:@"class %@ MISSING", className]);
+        return;
+    }
+    NSMutableArray<NSString *> *found = [NSMutableArray array];
+    for (int pass = 0; pass < 2; pass++) {
+        Class target = pass == 0 ? cls : object_getClass(cls);
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(target, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *name = NSStringFromSelector(method_getName(methods[i]));
+            for (NSString *needle in needles) {
+                if ([name.lowercaseString containsString:needle]) {
+                    [found addObject:[(pass == 0 ? @"-" : @"+") stringByAppendingString:name]];
+                    break;
+                }
+            }
+        }
+        free(methods);
+    }
+    [found sortUsingSelector:@selector(compare:)];
+    BrowserDiagPrint([NSString stringWithFormat:@"class %@ methods: %@", className, [found componentsJoinedByString:@" "]]);
+}
+
+static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
+    if (!BrowserMediaDiagnosticsEnabled() || configuration == nil) {
+        return;
+    }
+    static dispatch_once_t probeToken;
+    dispatch_once(&probeToken, ^{
+        BrowserDiagPrintMethods(@"_WKWebsiteDataStoreConfiguration", @[@"directory", @"storage", @"init", @"file", @"persistent"]);
+        BrowserDiagPrintMethods(@"WKWebsiteDataStore", @[@"init", @"configuration", @"datastore", @"identifier"]);
+    });
+    Class userScriptClass = NSClassFromString(kBrowserUserScriptClassName);
+    SEL userContentControllerGetter = NSSelectorFromString(@"userContentController");
+    SEL userScriptInitializer = NSSelectorFromString(@"initWithSource:injectionTime:forMainFrameOnly:");
+    if (userScriptClass == Nil || ![configuration respondsToSelector:userContentControllerGetter] ||
+        ![userScriptClass instancesRespondToSelector:userScriptInitializer]) {
+        return;
+    }
+    id userContentController = ((id (*)(id, SEL))objc_msgSend)(configuration, userContentControllerGetter);
+    id userScript = ((id (*)(id, SEL))objc_msgSend)((id)userScriptClass, @selector(alloc));
+    userScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(userScript, userScriptInitializer, BrowserMediaDiagnosticsHookScript(), 0, YES);
+    if (userContentController != nil && userScript != nil) {
+        ((void (*)(id, SEL, id))objc_msgSend)(userContentController, NSSelectorFromString(@"addUserScript:"), userScript);
+        BrowserDiagPrint(@"diagnostics hooks installed");
+    }
+}
+
 @interface BrowserWebView ()
 
 @property (nullable, nonatomic, strong) id runtimeWebView;
@@ -490,6 +835,10 @@ static void BrowserInstallYouTubeCaptureUserScript(id configuration) {
 @property (nullable, nonatomic, copy) NSString *lastTitle;
 @property (nonatomic, copy) NSString *userAgent;
 @property (nonatomic) BOOL loading;
+@property (nonatomic, readwrite) double estimatedProgress;
+@property (nonatomic) BOOL observingProgress;
+@property (nonatomic) NSTimer *diagnosticsTimer;
+@property (nonatomic) NSUInteger diagnosticsTicks;
 
 @end
 
@@ -529,12 +878,19 @@ static void BrowserInstallYouTubeCaptureUserScript(id configuration) {
     }
 
     id configuration = ((id (*)(id, SEL))objc_msgSend)((id)configurationClass, @selector(new));
+    id websiteDataStore = BrowserSharedWebsiteDataStore();
+    SEL setWebsiteDataStoreSelector = NSSelectorFromString(@"setWebsiteDataStore:");
+    if (websiteDataStore != nil && [configuration respondsToSelector:setWebsiteDataStoreSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(configuration, setWebsiteDataStoreSelector, websiteDataStore);
+    }
     SEL allowsInlineMediaPlaybackSelector = NSSelectorFromString(@"setAllowsInlineMediaPlayback:");
     if (configuration != nil && [configuration respondsToSelector:allowsInlineMediaPlaybackSelector]) {
         ((void (*)(id, SEL, BOOL))objc_msgSend)(configuration, allowsInlineMediaPlaybackSelector, allowsInlineMediaPlayback);
     }
     BrowserConfigurePrivateMediaPreferences(configuration);
     BrowserInstallYouTubeCaptureUserScript(configuration);
+    BrowserInstallCrossOriginHLSUserScript(configuration);
+    BrowserInstallMediaDiagnosticsUserScript(configuration);
 
     id webViewObject = ((id (*)(id, SEL))objc_msgSend)((id)webViewClass, @selector(alloc));
     SEL initializer = NSSelectorFromString(@"initWithFrame:configuration:");
@@ -561,6 +917,47 @@ static void BrowserInstallYouTubeCaptureUserScript(id configuration) {
 
     [self addSubview:runtimeView];
     [self setUserAgent:userAgent];
+
+    for (NSString *keyPath in @[@"estimatedProgress", @"loading"]) {
+        [webViewObject addObserver:self forKeyPath:keyPath options:NSKeyValueObservingOptionNew context:BrowserWebViewProgressObservationContext];
+    }
+    self.observingProgress = YES;
+}
+
+- (void)dealloc {
+    if (self.observingProgress) {
+        for (NSString *keyPath in @[@"estimatedProgress", @"loading"]) {
+            [self.runtimeWebView removeObserver:self forKeyPath:keyPath context:BrowserWebViewProgressObservationContext];
+        }
+    }
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary<NSKeyValueChangeKey, id> *)change context:(void *)context {
+    if (context != BrowserWebViewProgressObservationContext) {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+        return;
+    }
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self reportLoadProgress];
+        });
+        return;
+    }
+    [self reportLoadProgress];
+}
+
+- (void)reportLoadProgress {
+    id webView = self.runtimeWebView;
+    if (webView == nil) {
+        return;
+    }
+    double progress = [[webView valueForKey:@"estimatedProgress"] doubleValue];
+    BOOL loading = [[webView valueForKey:@"loading"] boolValue];
+    self.estimatedProgress = progress;
+    self.loading = loading;
+    if ([self.delegate respondsToSelector:@selector(webView:didChangeLoadProgress:loading:)]) {
+        [self.delegate webView:self didChangeLoadProgress:progress loading:loading];
+    }
 }
 
 - (void)layoutSubviews {
@@ -895,7 +1292,47 @@ static void BrowserInstallYouTubeCaptureUserScript(id configuration) {
     }
 }
 
+- (void)evaluateDiagnosticsScript:(NSString *)script label:(NSString *)label {
+    SEL selector = NSSelectorFromString(@"evaluateJavaScript:completionHandler:");
+    if (![self.runtimeWebView respondsToSelector:selector]) {
+        return;
+    }
+    // Asynchronous on purpose: no run-loop pumping.
+    ((void (*)(id, SEL, id, id))objc_msgSend)(self.runtimeWebView, selector, script, ^(id result, NSError *error) {
+        if (error != nil) {
+            BrowserDiagPrint([NSString stringWithFormat:@"%@ ERROR %@", label, error.localizedDescription]);
+        } else if (result != nil && result != [NSNull null]) {
+            BrowserDiagPrint([NSString stringWithFormat:@"%@ %@", label, result]);
+        }
+    });
+}
+
+- (void)startMediaDiagnosticsIfNeeded {
+    if (!BrowserMediaDiagnosticsEnabled() || self.window == nil) {
+        return;
+    }
+    [self.diagnosticsTimer invalidate];
+    self.diagnosticsTicks = 0;
+    BrowserDiagPrint([NSString stringWithFormat:@"page finished: %@", self.request.URL.absoluteString]);
+    [self evaluateDiagnosticsScript:BrowserMediaDiagnosticsCapabilityScript() label:@"capabilities"];
+    __weak typeof(self) weakSelf = self;
+    self.diagnosticsTimer = [NSTimer scheduledTimerWithTimeInterval:3.0 repeats:YES block:^(NSTimer *timer) {
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf == nil || strongSelf.diagnosticsTicks >= 60) {
+            [timer invalidate];
+            return;
+        }
+        strongSelf.diagnosticsTicks += 1;
+        if (strongSelf.diagnosticsTicks == 3 && [[NSUserDefaults standardUserDefaults] boolForKey:@"BrowserMediaDiagnosticsAutoPlay"]) {
+            [strongSelf evaluateDiagnosticsScript:BrowserMediaDiagnosticsAutoPlayScript() label:@"autoplay"];
+        }
+        [strongSelf evaluateDiagnosticsScript:BrowserMediaDiagnosticsReportScript()
+                                        label:[NSString stringWithFormat:@"report t+%lus", (unsigned long)(strongSelf.diagnosticsTicks * 3)]];
+    }];
+}
+
 - (void)webView:(id)webView didFinishNavigation:(id)navigation {
+    [self startMediaDiagnosticsIfNeeded];
     self.loading = NO;
     self.lastTitle = [self title];
     self.lastRequest = [self request];
@@ -922,6 +1359,13 @@ static void BrowserInstallYouTubeCaptureUserScript(id configuration) {
 
 - (void)webViewWebContentProcessDidTerminate:(id)webView {
     self.loading = NO;
+    self.estimatedProgress = 0.0;
+    if ([self.delegate respondsToSelector:@selector(webView:didChangeLoadProgress:loading:)]) {
+        [self.delegate webView:self didChangeLoadProgress:0.0 loading:NO];
+    }
+    if ([self.delegate respondsToSelector:@selector(webViewContentProcessDidTerminate:)]) {
+        [self.delegate webViewContentProcessDidTerminate:self];
+    }
 }
 
 - (NSURLRequest *)requestFromNavigationAction:(id)navigationAction {
@@ -1005,13 +1449,8 @@ windowFeatures:(id)windowFeatures {
 }
 
 + (id)defaultWebsiteDataStore {
-    BrowserEnsureWebKitRuntimeLoaded();
-    Class dataStoreClass = NSClassFromString(kBrowserWebsiteDataStoreClassName);
-    SEL selector = NSSelectorFromString(@"defaultDataStore");
-    if (dataStoreClass == Nil || ![dataStoreClass respondsToSelector:selector]) {
-        return nil;
-    }
-    return ((id (*)(id, SEL))objc_msgSend)((id)dataStoreClass, selector);
+    // The store every web view uses, so cookie save/restore and "clear data" act on it.
+    return BrowserSharedWebsiteDataStore();
 }
 
 + (id)defaultCookieStore {
@@ -1023,7 +1462,8 @@ windowFeatures:(id)windowFeatures {
     return ((id (*)(id, SEL))objc_msgSend)(dataStore, selector);
 }
 
-+ (NSArray<NSHTTPCookie *> *)allCookies {
+/// Returns nil if the cookie store did not answer in time.
++ (nullable NSArray<NSHTTPCookie *> *)fetchAllCookies {
     id cookieStore = [self defaultCookieStore];
     SEL selector = NSSelectorFromString(@"getAllCookies:");
     if (cookieStore == nil || ![cookieStore respondsToSelector:selector]) {
@@ -1036,12 +1476,20 @@ windowFeatures:(id)windowFeatures {
         cookies = fetchedCookies;
         finished = YES;
     });
-    BrowserPumpRunLoopUntil(&finished);
-    return cookies ?: @[];
+    BrowserPumpRunLoopUntilWithTimeout(&finished, 10.0);
+    return finished ? (cookies ?: @[]) : nil;
+}
+
++ (NSArray<NSHTTPCookie *> *)allCookies {
+    return [self fetchAllCookies] ?: @[];
 }
 
 + (NSData *)cookieDataRepresentation {
-    NSArray<NSHTTPCookie *> *cookies = [self allCookies];
+    NSArray<NSHTTPCookie *> *cookies = [self fetchAllCookies];
+    if (cookies == nil) {
+        // Don't overwrite the saved cookies with an empty list after a timeout.
+        return nil;
+    }
     NSError *error = nil;
     NSData *cookieData = [NSKeyedArchiver archivedDataWithRootObject:cookies requiringSecureCoding:NO error:&error];
     return error == nil ? cookieData : nil;
@@ -1076,7 +1524,7 @@ windowFeatures:(id)windowFeatures {
             finished = remainingCount == 0;
         });
     }
-    BrowserPumpRunLoopUntil(&finished);
+    BrowserPumpRunLoopUntilWithTimeout(&finished, 10.0);
 }
 
 + (NSSet<NSString *> *)allWebsiteDataTypes {

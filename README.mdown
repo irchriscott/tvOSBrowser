@@ -14,14 +14,39 @@ tvOS Browser
 - New modern Liquid Glass UI
 - Added (experimental) full screen video player, which you can enable in the Menu
 
+This repository is a fork of [jvanakker/tvOSBrowser](https://github.com/jvanakker/tvOSBrowser) with the bug fixes and improvements listed below.
+
 This code is provided as is with no warrenty or liability. Use at your own risk and do ***not*** distribute builds of this project on the App Store.
+
+
+What's New in This Fork
+=============
+
+Improvements
+-------------
+- **Native Home page.** Home and new tabs open a built-in start page instead of a web URL: the browser wordmark, a search/address field, a grid of **Pinned** sites (your Favorites, shown with each site's own icon or a coloured monogram) and the last 10 **Recently Closed** tabs. Press and hold Select on a tile for Open, Open in New Tab, Pin, Remove and Clear options. The page is fully driven by the tvOS focus engine, and you can swipe up from it into the top bar.
+- **Redesigned top bar.** SF Symbol buttons grouped as navigation (back, forward, reload), a centred address field (lock icon for https, clean `site.com/path` display) and actions (home, tabs, hide bar, menu). Focus uses the standard tvOS white lift instead of a blue glow, back/forward are dimmed when unavailable, the tabs button shows how many tabs are open, and the home icon is filled while on Home.
+- **Page loading indicator.** The address field fills left to right with WebKit's real load progress, together with a spinner. When the top bar is hidden, a thin progress line runs across the top of the screen instead.
+- **Redesigned Tabs page.** Full screen over a blurred backdrop, with a header showing how many tabs are open and on-screen remote hints. Cards have proper thumbnails, site icons, a "Current" badge, a white focus ring and a "Close" hint, and the New Tab card shows when the 5-tab limit is reached.
+- **Persistent site data.** localStorage, IndexedDB, cookies and caches now survive app restarts. tvOS does not let apps write to WebKit's default location, so site data is kept in the app's Caches folder (tvOS may clear it if the device runs low on space).
+- **Media diagnostics mode** for debugging sites on a real Apple TV (see below).
+
+Bug fixes
+-------------
+- **Launch failure on newer SDKs.** Adopted the UIKit scene lifecycle ("UIScene life cycle is required for apps built with this SDK").
+- **App freezing when moving the cursor.** The link-hover check ran synchronous JavaScript inside every touch event, which nested UIKit events until the app was killed ("sendEvent: nesting level exceeded"). It now runs after each event, one check at a time, and JavaScript waits time out instead of hanging.
+- **Black pages after switching to scroll mode.** WebKit's page process crashes are now detected: the page reloads automatically and returns to its scroll position, and a "This page stopped responding" screen appears if it crashes again within 30 seconds. Scroll mode now uses only the app's own scrolling instead of scrolling every page twice.
+- **Only trailers playing on some sites.** With the full screen player enabled, Select on a site's Play button grabbed the muted background trailer playing behind it. Decorative background videos are now ignored, and buttons or links outside a video player get a normal click.
+- **Movies not loading (HLS streams).** tvOS WebKit has no MediaSource, so players such as hls.js hand the `.m3u8` straight to `<video>`, and those requests carry no `Origin` header, which many video hosts reject. Cross-site HLS video is now loaded in CORS mode so the header is sent, and the full screen player sends the page's Origin/Referer too.
+- **Unwanted clicks after using the top bar or Home.** Selecting a top bar button or a Home tile no longer also clicks at the cursor position on the page underneath.
+- **Site storage silently lost** on every app restart (see Persistent site data above).
 
 
 How to Install tvOS Browser
 =============
 
 There is ***no*** ready to use binary available on this repository. You need to install Xcode and build/run the project yourself.
-To install this app, connect your Apple TV to your macOS computer via WiFi (or USB on older devices). Open this project in Xcode and install to your Apple TV.
+To install this app, connect your Apple TV to your macOS computer via WiFi (or USB on older devices). Open this project in Xcode, select your own development team and a unique bundle identifier under Signing & Capabilities, and install to your Apple TV.
 Connecting to your Apple TV wirelessly: http://www.redmondpie.com/how-to-wirelessly-connect-apple-tv-4k-to-xcode-on-mac/.
 
 How to Use tvOSBrowser
@@ -30,14 +55,16 @@ How to Use tvOSBrowser
 Quick start:
 - Double press on the center of the touch area of the Apple TV Remote to switch between cursor & scroll mode.
 - Press the touch area while in cursor mode to click.
-- Single tap to Menu button to go back, or exit if it's root page.
+- Swipe up (or press up) to move into the top bar; on the Home page, simply move focus up from the tiles.
+- Single tap to Menu button to go back, or exit if it's root page. On the Home page it returns to the page you came from.
 - Single tap the Play/Pause button to show the Quick Menu, with: input URLs, search Google, reload the page, or go forward.
-- Double tap the Play/Pause button to: display the full Side Menu, with: Favorites, History, set/open homepage, change user agent, clear cache, and clear cookies and more.
+- Double tap the Play/Pause button to: display the full Side Menu, with: Favorites, History, open the Home page, change user agent, clear cache, and clear cookies and more.
+- On the Home page, press and hold Select on a pinned site or recently closed tab for more options.
+- On the Tabs page, press Play/Pause to close the focused tab.
 
 The Side menu lets you:
-- Go to Home page
-- Set Home page
-- Manage Favorites
+- Go to the Home page
+- Manage Favorites (shown as Pinned sites on the Home page)
 - Manage History
 - Show Tabs
 - Open New Tab
@@ -48,5 +75,10 @@ The Side menu lets you:
 - Switch Desktop/Mobile User Agent
 - Show some video diagnostics
 - Clear cache
-- Cleare cookies
+- Clear cookies
 - Show the usage guide
+
+Media Diagnostics
+=============
+
+To debug why a site misbehaves on a real Apple TV, launch the app with the argument `-BrowserMediaDiagnostics YES` (in Xcode: Edit Scheme > Run > Arguments). Lines prefixed with `[BDIAG]` are printed to the console with the page's media capabilities (MediaSource, native HLS, WebAssembly, JavaScript speed), video element state and events, network requests, script errors and a storage persistence check. Add `-savedURLtoReopen <url>` to open a page at launch, and `-BrowserMediaDiagnosticsAutoPlay YES` to try starting the page's video automatically.

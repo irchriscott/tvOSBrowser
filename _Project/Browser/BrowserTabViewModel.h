@@ -11,6 +11,7 @@
 @property (nonatomic) CGPoint savedScrollOffset;
 @property (nonatomic) BOOL hasSavedScrollOffset;
 @property (nonatomic) BOOL needsScrollRestore;
+@property (nonatomic) BOOL showingHome;
 
 - (instancetype)initWithSessionRepresentation:(NSDictionary *)sessionRepresentation;
 - (NSDictionary *)sessionRepresentation;

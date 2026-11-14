@@ -24,13 +24,6 @@ typedef NS_ENUM(NSInteger, BrowserTopBarAction) {
 @interface BrowserTopBarView : UIVisualEffectView
 
 @property (nonatomic, weak, nullable) id<BrowserTopBarViewDelegate> delegate;
-@property (nonatomic, readonly) UIImageView *backImageView;
-@property (nonatomic, readonly) UIImageView *refreshImageView;
-@property (nonatomic, readonly) UIImageView *forwardImageView;
-@property (nonatomic, readonly) UIImageView *homeImageView;
-@property (nonatomic, readonly) UIImageView *tabsImageView;
-@property (nonatomic, readonly) UIImageView *fullscreenImageView;
-@property (nonatomic, readonly) UIImageView *menuImageView;
 @property (nonatomic, readonly) UILabel *URLLabel;
 @property (nonatomic, readonly) UIActivityIndicatorView *loadingSpinner;
 @property (nonatomic, readonly, getter=isFocusModeActive) BOOL focusModeActive;
@@ -38,6 +31,15 @@ typedef NS_ENUM(NSInteger, BrowserTopBarAction) {
 - (CGRect)interactiveFrameForView:(UIView *)view;
 - (void)setFocusModeActive:(BOOL)focusModeActive;
 - (nullable UIView *)preferredFocusItem;
+
+/// Shows a page address in the address field (scheme and "www." are hidden,
+/// a lock is shown for https). Pass nil to show the Home placeholder.
+- (void)setDisplayedURLString:(nullable NSString *)URLString;
+- (void)setBackEnabled:(BOOL)backEnabled forwardEnabled:(BOOL)forwardEnabled;
+- (void)setTabCount:(NSUInteger)tabCount;
+- (void)setHomeActive:(BOOL)homeActive;
+/// Fills the address field left-to-right while a page loads and shows the spinner.
+- (void)setLoadProgress:(double)progress loading:(BOOL)loading animated:(BOOL)animated;
 
 @end
 

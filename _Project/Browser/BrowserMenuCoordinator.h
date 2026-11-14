@@ -13,6 +13,7 @@
 
 - (void)browserPresentViewController:(UIViewController *)viewController;
 - (void)browserLoadHomePage;
+- (void)browserLoadRequest:(NSURLRequest *)request;
 - (void)browserShowHints;
 - (void)browserShowTabOverview;
 - (void)browserCreateNewTabLoadingHomePage:(BOOL)loadHomePage;

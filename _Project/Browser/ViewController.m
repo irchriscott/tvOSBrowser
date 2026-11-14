@@ -8,6 +8,7 @@
 
 #import "BrowserMenuCoordinator.h"
 #import "BrowserDOMInteractionService.h"
+#import "BrowserHomeView.h"
 #import "BrowserNavigationService.h"
 #import "BrowserPageActionCoordinator.h"
 #import "BrowserPreferencesStore.h"
@@ -46,6 +47,9 @@ static UIColor *kTextColor(void) {
 @property (nonatomic) BOOL displayedHintsOnLaunch;
 @property (nonatomic) BOOL scrollViewAllowBounces;
 @property (nonatomic, getter=isTopBarFocusActive) BOOL topBarFocusActive;
+@property (nonatomic) BOOL homeWasVisible;
+/// Cursor/scroll mode to return to on web pages; Home always runs without the cursor.
+@property (nonatomic) BOOL cursorModeBeforeHome;
 
 @end
 
@@ -57,6 +61,7 @@ static UIColor *kTextColor(void) {
     [super viewDidLoad];
     self.definesPresentationContext = YES;
     self.scrollViewAllowBounces = YES;
+    self.cursorModeBeforeHome = YES;
 
     self.preferencesStore = [BrowserPreferencesStore new];
     [self.preferencesStore ensureUserAgentConsistency];
@@ -156,6 +161,9 @@ static UIColor *kTextColor(void) {
 
 - (void)handleGlobalSelectPressEndedNotification:(NSNotification *)notification {
     (void)notification;
+    if (self.tabCoordinator.showingHome) {
+        return;
+    }
     [self.remoteInputController handleGlobalSelectPressEndedNotification];
 }
 
@@ -173,6 +181,50 @@ static UIColor *kTextColor(void) {
 
 - (void)loadHomePage {
     [self.tabCoordinator loadHomePage];
+}
+
+- (void)loadRequestInActiveTab:(NSURLRequest *)request {
+    if (request == nil) {
+        return;
+    }
+    [self.tabCoordinator dismissHomeIfNeeded];
+    [self.webview loadRequest:request];
+}
+
+- (void)browserTabCoordinatorHomeVisibilityChanged:(BOOL)visible {
+    if (visible && !self.homeWasVisible) {
+        // While the tab overview is up it has already parked the cursor; keep the saved preference.
+        if (!self.tabOverviewController.visible) {
+            self.cursorModeBeforeHome = self.remoteInputController.cursorModeEnabled;
+        }
+        [self.remoteInputController setCursorModeEnabled:NO];
+    } else if (!visible && self.homeWasVisible) {
+        [self.remoteInputController setCursorModeEnabled:self.cursorModeBeforeHome];
+    }
+    self.homeWasVisible = visible;
+    [self updateTopBarFocusability];
+    [self setNeedsFocusUpdate];
+    [self updateFocusIfNeeded];
+}
+
+- (void)browserTabCoordinatorShowAddressEntry {
+    [self showInputURLorSearchGoogle];
+}
+
+- (void)browserTabCoordinatorDidConsumeSelectPress {
+    [self.remoteInputController suppressGlobalSelectPress];
+}
+
+/// On Home the top bar is part of normal focus navigation (swipe up from the
+/// tiles); on web pages it only takes focus while top-bar focus mode is active.
+- (BOOL)isHomeTopBarFocusAvailable {
+    return self.tabCoordinator.showingHome &&
+        self.viewModel.topNavigationBarVisible &&
+        !self.topMenuView.hidden;
+}
+
+- (void)updateTopBarFocusability {
+    [self.topMenuView setFocusModeActive:self.topBarFocusActive || [self isHomeTopBarFocusAvailable]];
 }
 
 - (void)showAdvancedMenu {
@@ -196,7 +248,7 @@ static UIColor *kTextColor(void) {
     }
 
     self.topBarFocusActive = YES;
-    [self.topMenuView setFocusModeActive:YES];
+    [self updateTopBarFocusability];
     [self.remoteInputController refreshInteractionState];
     [self setNeedsFocusUpdate];
     [self updateFocusIfNeeded];
@@ -208,26 +260,35 @@ static UIColor *kTextColor(void) {
     }
 
     self.topBarFocusActive = NO;
-    [self.topMenuView setFocusModeActive:NO];
+    [self updateTopBarFocusability];
     [self.remoteInputController refreshInteractionState];
     [self setNeedsFocusUpdate];
     [self updateFocusIfNeeded];
 }
 
 - (void)performTopBarAction:(BrowserTopBarAction)action {
+    [self.remoteInputController suppressGlobalSelectPress];
     [self deactivateTopBarFocusMode];
 
+    BOOL showingHome = self.tabCoordinator.showingHome;
     switch (action) {
         case BrowserTopBarActionBack:
-            if (self.webview.canGoBack) {
+            if (showingHome) {
+                [self.tabCoordinator returnFromHomeToPage];
+            } else if (self.webview.canGoBack) {
                 [self.webview goBack];
             }
             break;
         case BrowserTopBarActionRefresh:
-            [self.webview reload];
+            if (showingHome) {
+                [self.tabCoordinator reloadHome];
+            } else {
+                [self.webview reload];
+            }
             break;
         case BrowserTopBarActionForward:
             if (self.webview.canGoForward) {
+                [self.tabCoordinator dismissHomeIfNeeded];
                 [self.webview goForward];
             }
             break;
@@ -325,7 +386,7 @@ static UIColor *kTextColor(void) {
         UITextField *textField = alertController.textFields.firstObject;
         NSURLRequest *searchRequest = [weakSelf.navigationService googleSearchRequestForQuery:textField.text];
         if (searchRequest != nil) {
-            [weakSelf.webview loadRequest:searchRequest];
+            [weakSelf loadRequestInActiveTab:searchRequest];
         } else {
             [weakSelf requestURLorSearchInput];
         }
@@ -340,7 +401,7 @@ static UIColor *kTextColor(void) {
         }
         NSURLRequest *navigationRequest = [weakSelf.navigationService requestForEnteredAddressString:textField.text];
         if (navigationRequest != nil) {
-            [weakSelf.webview loadRequest:navigationRequest];
+            [weakSelf loadRequestInActiveTab:navigationRequest];
         } else {
             [weakSelf requestURLorSearchInput];
         }
@@ -359,7 +420,8 @@ static UIColor *kTextColor(void) {
                                                                              message:@""
                                                                       preferredStyle:UIAlertControllerStyleAlert];
 
-    if (self.webview.canGoForward) {
+    BOOL showingHome = self.tabCoordinator.showingHome;
+    if (!showingHome && self.webview.canGoForward) {
         [alertController addAction:[UIAlertAction actionWithTitle:@"Go Forward"
                                                             style:UIAlertActionStyleDefault
                                                           handler:^(__unused UIAlertAction *action) {
@@ -373,7 +435,7 @@ static UIColor *kTextColor(void) {
         [self showInputURLorSearchGoogle];
     }]];
 
-    if (self.webview.request != nil && self.webview.request.URL.absoluteString.length > 0) {
+    if (!showingHome && self.webview.request != nil && self.webview.request.URL.absoluteString.length > 0) {
         [alertController addAction:[UIAlertAction actionWithTitle:@"Reload Page"
                                                             style:UIAlertActionStyleDefault
                                                           handler:^(__unused UIAlertAction *action) {
@@ -412,6 +474,9 @@ static UIColor *kTextColor(void) {
 }
 
 - (void)browserHandlePrimaryAction {
+    if ([self.tabCoordinator reloadCrashedActiveTabIfNeeded]) {
+        return;
+    }
     if (!self.remoteInputController.cursorModeEnabled || self.webview == nil) {
         return;
     }
@@ -431,6 +496,12 @@ static UIColor *kTextColor(void) {
         UIView *preferredFocusItem = [self.topMenuView preferredFocusItem];
         if (preferredFocusItem != nil) {
             return @[preferredFocusItem];
+        }
+    }
+    if (self.tabCoordinator.showingHome) {
+        BrowserHomeView *homeView = self.tabCoordinator.homeView;
+        if (homeView != nil && !homeView.hidden) {
+            return @[homeView];
         }
     }
     return [super preferredFocusEnvironments];
@@ -487,6 +558,10 @@ static UIColor *kTextColor(void) {
     [self loadHomePage];
 }
 
+- (void)browserLoadRequest:(NSURLRequest *)request {
+    [self loadRequestInActiveTab:request];
+}
+
 - (void)browserShowHints {
     [self showHintsAlert];
 }
@@ -506,12 +581,14 @@ static UIColor *kTextColor(void) {
     self.viewModel.topNavigationBarVisible = NO;
     self.preferencesStore.topNavigationBarVisible = NO;
     [self.tabCoordinator setTopNavigationVisible:NO];
+    [self updateTopBarFocusability];
 }
 
 - (void)browserShowTopNav {
     self.viewModel.topNavigationBarVisible = YES;
     self.preferencesStore.topNavigationBarVisible = YES;
     [self.tabCoordinator setTopNavigationVisible:YES];
+    [self updateTopBarFocusability];
 }
 
 - (void)browserUpdateTextFontSize {
@@ -573,10 +650,23 @@ static UIColor *kTextColor(void) {
 #pragma mark - BrowserTabOverviewControllerHost
 
 - (BOOL)browserTabOverviewControllerCursorModeEnabled {
+    if (self.tabCoordinator.showingHome) {
+        return self.cursorModeBeforeHome;
+    }
     return self.remoteInputController.cursorModeEnabled;
 }
 
 - (void)browserTabOverviewControllerSetCursorModeEnabled:(BOOL)enabled {
+    if (self.tabCoordinator.showingHome) {
+        // Home never uses the cursor. When the overview is closing (no longer
+        // visible) it hands back the web preference; keep that for the next page.
+        if (!self.tabOverviewController.visible) {
+            self.cursorModeBeforeHome = enabled;
+        }
+        [self.remoteInputController setCursorModeEnabled:NO];
+        [self setNeedsFocusUpdate];
+        return;
+    }
     [self.remoteInputController setCursorModeEnabled:enabled];
 }
 
@@ -609,6 +699,9 @@ static UIColor *kTextColor(void) {
 #pragma mark - BrowserRemoteInputControllerHost
 
 - (UIScrollView *)browserRemoteInputControllerActiveScrollView {
+    if (self.tabCoordinator.showingHome) {
+        return nil;
+    }
     return self.webview.scrollView;
 }
 
@@ -660,7 +753,9 @@ static UIColor *kTextColor(void) {
     UIAlertController *alertController = (UIAlertController *)self.presentedViewController;
     if (alertController != nil) {
         [self.presentedViewController dismissViewControllerAnimated:YES completion:nil];
-    } else if (self.webview.canGoBack) {
+    } else if ([self.tabCoordinator returnFromHomeToPage]) {
+        return;
+    } else if (!self.tabCoordinator.showingHome && self.webview.canGoBack) {
         [self.webview goBack];
     } else {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Exit App?"
@@ -727,6 +822,14 @@ static UIColor *kTextColor(void) {
     [self.tabCoordinator webViewDidStartLoad:webView];
 }
 
+- (void)webView:(id)webView didChangeLoadProgress:(double)progress loading:(BOOL)loading {
+    [self.tabCoordinator webView:webView didChangeLoadProgress:progress loading:loading];
+}
+
+- (void)webViewContentProcessDidTerminate:(id)webView {
+    [self.tabCoordinator webViewContentProcessDidTerminate:webView];
+}
+
 - (void)webViewDidFinishLoad:(id)webView {
     [self.tabCoordinator webViewDidFinishLoad:webView];
     if (self.tabOverviewController.visible) {
@@ -760,10 +863,7 @@ static UIColor *kTextColor(void) {
         return;
     }
 
-    if (tab == self.tabCoordinator.activeTab) {
-        [self.topMenuView.loadingSpinner stopAnimating];
-    }
-    if (tab != self.tabCoordinator.activeTab) {
+    if (tab != self.tabCoordinator.activeTab || tab.showingHome) {
         return;
     }
     if ([self.navigationService shouldIgnoreLoadError:error]) {
@@ -779,9 +879,7 @@ static UIColor *kTextColor(void) {
                                                             style:UIAlertActionStyleDefault
                                                           handler:^(__unused UIAlertAction *action) {
             NSURLRequest *searchRequest = [weakSelf.navigationService googleSearchRequestForFailedRequestURLString:tab.requestURL];
-            if (searchRequest != nil) {
-                [weakSelf.webview loadRequest:searchRequest];
-            }
+            [weakSelf loadRequestInActiveTab:searchRequest];
         }]];
     }
     if (self.webview.request != nil && self.webview.request.URL.absoluteString.length > 0) {
@@ -810,6 +908,16 @@ static UIColor *kTextColor(void) {
 }
 
 - (void)pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    // Home is focus-driven: let the focus engine own Select and the arrows there,
+    // instead of the cursor/scroll handling (which would also open top-bar focus mode).
+    if (self.tabCoordinator.showingHome && !self.topBarFocusActive && self.presentedViewController == nil) {
+        for (UIPress *press in presses) {
+            if (press.type == UIPressTypeSelect || press.type == UIPressTypeUpArrow || press.type == UIPressTypeDownArrow || press.type == UIPressTypeLeftArrow || press.type == UIPressTypeRightArrow) {
+                [super pressesEnded:presses withEvent:event];
+                return;
+            }
+        }
+    }
     if ([self.remoteInputController handlePressesEnded:presses withEvent:event]) {
         return;
     }

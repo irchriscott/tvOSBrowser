@@ -126,7 +126,11 @@ static BOOL const kBrowserYouTubeNativeExtractionEnabled = NO;
         NSString *title = [videoInfo[@"title"] isKindOfClass:[NSString class]] ? videoInfo[@"title"] : self.host.browserCurrentPageTitle;
         [self presentNativeVideoPlayerForURL:videoURL title:title];
     } else {
-        [self presentUnsupportedNativeVideoAlertForVideoInfo:videoInfo ?: @{}];
+        // The activation step above already clicked the target, so the page handles it
+        // (e.g. an hls.js player that only exposes a blob: URL, or a Play button that
+        // opens a separate watch page). An alert here would just interrupt playback.
+        // The explicit "play video under cursor" action still reports unsupported videos.
+        NSLog(@"[Browser] No native-playable video after Select; leaving playback to the page. Sources: %@", videoInfo[@"sources"] ?: @"(none)");
     }
     return YES;
 }
@@ -173,7 +177,11 @@ static BOOL const kBrowserYouTubeNativeExtractionEnabled = NO;
 }
 
 - (void)presentNativeVideoPlayerForURL:(NSURL *)URL title:(NSString *)title {
-    [self presentNativeVideoPlayerForURL:URL title:title requestHeaders:nil cookies:nil];
+    // Send what the page itself would: many HLS hosts reject requests without the
+    // page's Origin/Referer (e.g. 404 for the master playlist and every segment).
+    NSURL *pageURL = self.host.browserWebView.request.URL;
+    NSDictionary<NSString *, NSString *> *headers = [self browserHeadersForPlaybackURL:URL pageURL:pageURL];
+    [self presentNativeVideoPlayerForURL:URL title:title requestHeaders:headers cookies:nil];
 }
 
 - (void)presentNativeVideoPlayerForURL:(NSURL *)URL
@@ -197,7 +205,7 @@ static BOOL const kBrowserYouTubeNativeExtractionEnabled = NO;
     [self.host browserPresentViewController:playerViewController];
 }
 
-- (NSDictionary<NSString *, NSString *> *)browserHeadersForYouTubePlaybackURL:(NSURL *)playbackURL
+- (NSDictionary<NSString *, NSString *> *)browserHeadersForPlaybackURL:(NSURL *)playbackURL
                                                                        pageURL:(NSURL *)pageURL {
     if (playbackURL == nil || pageURL == nil) {
         return nil;
@@ -213,7 +221,8 @@ static BOOL const kBrowserYouTubeNativeExtractionEnabled = NO;
     NSString *origin = [NSString stringWithFormat:@"%@://%@", pageURL.scheme ?: @"https", pageURL.host ?: @"www.youtube.com"];
     headers[@"Origin"] = origin;
 
-    NSArray<NSHTTPCookie *> *cookies = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookiesForURL:pageURL];
+    // Only the media host's own cookies; never forward the page's cookies to another site.
+    NSArray<NSHTTPCookie *> *cookies = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookiesForURL:playbackURL];
     if (cookies.count > 0) {
         NSDictionary<NSString *, NSString *> *cookieHeaders = [NSHTTPCookie requestHeaderFieldsWithCookies:cookies];
         NSString *cookieHeader = cookieHeaders[@"Cookie"];
@@ -314,7 +323,7 @@ static BOOL const kBrowserYouTubeNativeExtractionEnabled = NO;
         if (result.playbackURL != nil) {
             NSString *title = result.title.length > 0 ? result.title : weakSelf.host.browserCurrentPageTitle;
             NSMutableDictionary<NSString *, NSString *> *headers = [NSMutableDictionary dictionaryWithDictionary:result.requestHeaders ?: @{}];
-            NSDictionary<NSString *, NSString *> *fallbackHeaders = [weakSelf browserHeadersForYouTubePlaybackURL:result.playbackURL pageURL:pageURL];
+            NSDictionary<NSString *, NSString *> *fallbackHeaders = [weakSelf browserHeadersForPlaybackURL:result.playbackURL pageURL:pageURL];
             [fallbackHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, __unused BOOL *stop) {
                 if (headers[key].length == 0 && value.length > 0) {
                     headers[key] = value;

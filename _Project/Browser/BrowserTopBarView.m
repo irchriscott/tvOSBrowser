@@ -8,59 +8,308 @@ static CGFloat const kTopBarHorizontalInset = 40.0;
 static CGFloat const kTopBarVerticalInset = 8.0;
 static CGFloat const kTopBarHeight = 86.0;
 static CGFloat const kTopBarMaxWidth = 1760.0;
-static CGFloat const kTopBarIconSize = 52.0;
-static CGFloat const kTopBarLeadingPadding = 28.0;
-static CGFloat const kTopBarTrailingPadding = 26.0;
-static CGFloat const kTopBarIconSpacing = 24.0;
-static CGFloat const kTopBarLabelSpacing = 28.0;
-static CGFloat const kTopBarSpinnerSpacing = 22.0;
-static CGFloat const kTopBarFocusHighlightInset = 10.0;
-static CGFloat const kTopBarUniformFocusHeight = 72.0;
+static CGFloat const kTopBarEdgePadding = 10.0;
+static CGFloat const kTopBarButtonSize = 66.0;
+static CGFloat const kTopBarButtonSpacing = 8.0;
+static CGFloat const kTopBarClusterSpacing = 28.0;
+static CGFloat const kTopBarAddressHeight = 62.0;
+static CGFloat const kTopBarSymbolPointSize = 27.0;
 
-@interface BrowserTopBarFocusButton : UIButton
+static NSString * const kTopBarHomePlaceholder = @"Search or enter website address";
+
+static UIColor *BrowserTopBarAccentColor(CGFloat alpha) {
+    return [UIColor colorWithRed:0.23 green:0.57 blue:1.0 alpha:alpha];
+}
+
+static UIImage *BrowserTopBarSymbol(NSString *name, CGFloat pointSize) {
+    UIImageSymbolConfiguration *configuration = [UIImageSymbolConfiguration configurationWithPointSize:pointSize weight:UIImageSymbolWeightSemibold];
+    return [[UIImage systemImageNamed:name withConfiguration:configuration] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+}
+
+#pragma mark - Button
+
+typedef NS_ENUM(NSInteger, BrowserTopBarButtonStyle) {
+    BrowserTopBarButtonStyleIcon = 0,
+    BrowserTopBarButtonStyleTabCount,
+    BrowserTopBarButtonStyleAddress
+};
+
+@interface BrowserTopBarButton : UIButton
 
 @property (nonatomic) BrowserTopBarAction topBarAction;
+@property (nonatomic) BrowserTopBarButtonStyle style;
+@property (nonatomic) BOOL focusable;
+@property (nonatomic, getter=isDimmed) BOOL dimmed;
+@property (nonatomic) UIView *backdropView;
+@property (nonatomic) UIImageView *iconView;
+@property (nonatomic) UILabel *textLabel;
+@property (nonatomic) UIActivityIndicatorView *spinner;
+@property (nonatomic) BOOL showsPlaceholder;
+@property (nonatomic) UIView *progressClipView;
+@property (nonatomic) UIView *progressFillView;
+@property (nonatomic) double loadProgress;
+@property (nonatomic) BOOL showsProgress;
+
+- (void)setLoadProgress:(double)progress loading:(BOOL)loading animated:(BOOL)animated;
 
 @end
 
-@implementation BrowserTopBarFocusButton
+@implementation BrowserTopBarButton
+
++ (instancetype)buttonWithStyle:(BrowserTopBarButtonStyle)style action:(BrowserTopBarAction)action {
+    BrowserTopBarButton *button = [BrowserTopBarButton buttonWithType:UIButtonTypeCustom];
+    button.style = style;
+    button.topBarAction = action;
+    [button commonSetup];
+    return button;
+}
+
+- (void)commonSetup {
+    self.backgroundColor = UIColor.clearColor;
+    self.clipsToBounds = NO;
+    self.accessibilityTraits = UIAccessibilityTraitButton;
+
+    self.backdropView = [UIView new];
+    self.backdropView.userInteractionEnabled = NO;
+    [self addSubview:self.backdropView];
+
+    self.iconView = [UIImageView new];
+    self.iconView.userInteractionEnabled = NO;
+    self.iconView.contentMode = UIViewContentModeCenter;
+    [self.backdropView addSubview:self.iconView];
+
+    if (self.style != BrowserTopBarButtonStyleIcon) {
+        self.textLabel = [UILabel new];
+        self.textLabel.userInteractionEnabled = NO;
+        [self.backdropView addSubview:self.textLabel];
+    }
+
+    if (self.style == BrowserTopBarButtonStyleTabCount) {
+        self.textLabel.font = [UIFont systemFontOfSize:19.0 weight:UIFontWeightBold];
+        self.textLabel.textAlignment = NSTextAlignmentCenter;
+        self.textLabel.layer.borderWidth = 3.0;
+        self.textLabel.layer.cornerRadius = 9.0;
+        self.textLabel.text = @"1";
+    } else if (self.style == BrowserTopBarButtonStyleAddress) {
+        self.textLabel.font = [UIFont systemFontOfSize:27.0 weight:UIFontWeightMedium];
+        self.textLabel.textAlignment = NSTextAlignmentCenter;
+        self.textLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+
+        self.progressClipView = [UIView new];
+        self.progressClipView.userInteractionEnabled = NO;
+        self.progressClipView.clipsToBounds = YES;
+        [self.backdropView insertSubview:self.progressClipView atIndex:0];
+
+        self.progressFillView = [UIView new];
+        self.progressFillView.alpha = 0.0;
+        [self.progressClipView addSubview:self.progressFillView];
+
+        self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+        self.spinner.hidesWhenStopped = YES;
+        self.spinner.userInteractionEnabled = NO;
+        [self.backdropView addSubview:self.spinner];
+    }
+
+    [self updateAppearanceFocused:NO];
+}
 
 - (BOOL)canBecomeFocused {
-    return self.enabled && !self.hidden && self.alpha > 0.01;
+    return self.focusable && !self.hidden && self.alpha > 0.01;
 }
 
 - (UIFocusSoundIdentifier)soundIdentifierForFocusUpdateInContext:(__unused UIFocusUpdateContext *)context {
     return UIFocusSoundIdentifierDefault;
 }
 
+- (CGFloat)cornerRadius {
+    return CGRectGetHeight(self.bounds) / 2.0;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    // bounds/center (not frame) so the focus scale transform stays valid.
+    self.backdropView.bounds = self.bounds;
+    self.backdropView.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
+    self.backdropView.layer.cornerRadius = [self cornerRadius];
+
+    CGFloat width = CGRectGetWidth(self.bounds);
+    CGFloat height = CGRectGetHeight(self.bounds);
+    switch (self.style) {
+        case BrowserTopBarButtonStyleIcon:
+            self.iconView.frame = self.backdropView.bounds;
+            break;
+        case BrowserTopBarButtonStyleTabCount:
+            self.textLabel.frame = CGRectMake((width - 34.0) / 2.0, (height - 34.0) / 2.0, 34.0, 34.0);
+            break;
+        case BrowserTopBarButtonStyleAddress: {
+            CGFloat sidePadding = 26.0;
+            CGFloat accessorySide = 34.0;
+            // Keep the text optically centred by reserving equal space on both sides.
+            CGFloat reserved = sidePadding + accessorySide + 12.0;
+            CGFloat textWidth = MAX(0.0, width - (reserved * 2.0));
+            [self.textLabel sizeToFit];
+            CGFloat labelWidth = MIN(CGRectGetWidth(self.textLabel.bounds), textWidth);
+            CGFloat labelX = floor((width - labelWidth) / 2.0);
+            self.textLabel.frame = CGRectMake(labelX, 0.0, labelWidth, height);
+            BOOL iconVisible = self.iconView.image != nil;
+            CGFloat iconX = iconVisible ? labelX - accessorySide - 8.0 : sidePadding;
+            self.iconView.frame = CGRectMake(MAX(sidePadding, iconX), (height - accessorySide) / 2.0, accessorySide, accessorySide);
+            self.spinner.frame = CGRectMake(width - sidePadding - accessorySide, (height - accessorySide) / 2.0, accessorySide, accessorySide);
+            self.progressClipView.frame = self.backdropView.bounds;
+            self.progressClipView.layer.cornerRadius = [self cornerRadius];
+            [self layoutProgressFill];
+            break;
+        }
+    }
+    [self applyLiftForFocused:self.isFocused];
+}
+
+- (void)layoutProgressFill {
+    CGRect bounds = self.progressClipView.bounds;
+    self.progressFillView.frame = CGRectMake(0.0, 0.0, round(CGRectGetWidth(bounds) * self.loadProgress), CGRectGetHeight(bounds));
+}
+
+- (void)setLoadProgress:(double)progress loading:(BOOL)loading animated:(BOOL)animated {
+    if (self.style != BrowserTopBarButtonStyleAddress) {
+        return;
+    }
+
+    if (loading) {
+        // Never show an empty bar: start visibly so the user sees something happen at once.
+        double clamped = MAX(0.1, MIN(progress, 1.0));
+        BOOL wasShowing = self.showsProgress;
+        self.showsProgress = YES;
+        if (!wasShowing) {
+            [self.progressFillView.layer removeAllAnimations];
+            self.loadProgress = 0.0;
+            [self layoutProgressFill];
+        }
+        self.loadProgress = MAX(self.loadProgress, clamped);
+        [UIView animateWithDuration:(animated ? 0.25 : 0.0)
+                              delay:0.0
+                            options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionCurveEaseOut
+                         animations:^{
+            self.progressFillView.alpha = 1.0;
+            [self layoutProgressFill];
+        } completion:nil];
+        [self.spinner startAnimating];
+        return;
+    }
+
+    [self.spinner stopAnimating];
+    if (!self.showsProgress) {
+        return;
+    }
+    self.showsProgress = NO;
+    if (!animated) {
+        self.loadProgress = 0.0;
+        self.progressFillView.alpha = 0.0;
+        [self layoutProgressFill];
+        return;
+    }
+    // Finish the sweep, then fade out.
+    self.loadProgress = 1.0;
+    [UIView animateWithDuration:0.2
+                          delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState
+                     animations:^{
+        [self layoutProgressFill];
+    } completion:^(__unused BOOL finished) {
+        if (self.showsProgress) {
+            return;
+        }
+        [UIView animateWithDuration:0.3 animations:^{
+            self.progressFillView.alpha = 0.0;
+        } completion:^(__unused BOOL fadeFinished) {
+            if (!self.showsProgress) {
+                self.loadProgress = 0.0;
+                [self layoutProgressFill];
+            }
+        }];
+    }];
+}
+
+- (void)applyLiftForFocused:(BOOL)focused {
+    CGFloat scale = 1.0;
+    if (focused) {
+        scale = self.style == BrowserTopBarButtonStyleAddress ? 1.03 : 1.1;
+    }
+    if (self.highlighted && focused) {
+        scale -= 0.06;
+    }
+    self.backdropView.transform = CGAffineTransformMakeScale(scale, scale);
+    self.backdropView.layer.shadowColor = UIColor.blackColor.CGColor;
+    self.backdropView.layer.shadowOpacity = focused ? 0.35 : 0.0;
+    self.backdropView.layer.shadowRadius = focused ? 14.0 : 0.0;
+    self.backdropView.layer.shadowOffset = CGSizeMake(0.0, focused ? 8.0 : 0.0);
+    self.backdropView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.backdropView.bounds cornerRadius:[self cornerRadius]].CGPath;
+}
+
+- (void)updateAppearanceFocused:(BOOL)focused {
+    UIColor *contentColor = focused ? [UIColor colorWithWhite:0.1 alpha:1.0] : [UIColor colorWithWhite:1.0 alpha:0.94];
+    CGFloat contentAlpha = (self.dimmed && !focused) ? 0.32 : (self.dimmed ? 0.45 : 1.0);
+
+    if (self.style == BrowserTopBarButtonStyleAddress) {
+        self.backdropView.backgroundColor = focused ? UIColor.whiteColor : [UIColor colorWithWhite:1.0 alpha:0.12];
+        UIColor *textColor = contentColor;
+        if (self.showsPlaceholder) {
+            textColor = focused ? [UIColor colorWithWhite:0.0 alpha:0.5] : [UIColor colorWithWhite:1.0 alpha:0.5];
+        }
+        self.textLabel.textColor = textColor;
+        self.iconView.tintColor = focused ? [UIColor colorWithWhite:0.0 alpha:0.55] : [UIColor colorWithWhite:1.0 alpha:0.6];
+        self.spinner.color = contentColor;
+        self.progressFillView.backgroundColor = BrowserTopBarAccentColor(focused ? 0.28 : 0.45);
+    } else {
+        self.backdropView.backgroundColor = focused ? UIColor.whiteColor : UIColor.clearColor;
+        self.iconView.tintColor = contentColor;
+        self.iconView.alpha = contentAlpha;
+        if (self.textLabel != nil) {
+            self.textLabel.textColor = contentColor;
+            self.textLabel.layer.borderColor = contentColor.CGColor;
+        }
+    }
+    [self applyLiftForFocused:focused];
+}
+
+- (void)setDimmed:(BOOL)dimmed {
+    _dimmed = dimmed;
+    [self updateAppearanceFocused:self.isFocused];
+}
+
+- (void)setHighlighted:(BOOL)highlighted {
+    [super setHighlighted:highlighted];
+    [UIView animateWithDuration:0.12 animations:^{
+        [self applyLiftForFocused:self.isFocused];
+    }];
+}
+
+- (void)didUpdateFocusInContext:(UIFocusUpdateContext *)context withAnimationCoordinator:(UIFocusAnimationCoordinator *)coordinator {
+    [super didUpdateFocusInContext:context withAnimationCoordinator:coordinator];
+    BOOL focused = context.nextFocusedView == self;
+    [coordinator addCoordinatedAnimations:^{
+        [self updateAppearanceFocused:focused];
+    } completion:nil];
+}
+
 @end
+
+#pragma mark - Top bar
 
 @interface BrowserTopBarView ()
 
 @property (nonatomic) UIView *chromeContainerView;
 @property (nonatomic) UIVisualEffectView *chromeEffectView;
-@property (nonatomic) UIImageView *backImageView;
-@property (nonatomic) UIImageView *refreshImageView;
-@property (nonatomic) UIImageView *forwardImageView;
-@property (nonatomic) UIImageView *homeImageView;
-@property (nonatomic) UIImageView *tabsImageView;
-@property (nonatomic) UIImageView *fullscreenImageView;
-@property (nonatomic) UIImageView *menuImageView;
-@property (nonatomic) UILabel *URLLabel;
-@property (nonatomic) UIActivityIndicatorView *loadingSpinner;
-@property (nonatomic) UIView *focusGlowView;
-@property (nonatomic) UIView *focusHighlightView;
-@property (nonatomic) NSArray<BrowserTopBarFocusButton *> *focusButtons;
-@property (nonatomic) BrowserTopBarFocusButton *backFocusButton;
-@property (nonatomic) BrowserTopBarFocusButton *refreshFocusButton;
-@property (nonatomic) BrowserTopBarFocusButton *forwardFocusButton;
-@property (nonatomic) BrowserTopBarFocusButton *homeFocusButton;
-@property (nonatomic) BrowserTopBarFocusButton *tabsFocusButton;
-@property (nonatomic) BrowserTopBarFocusButton *URLFocusButton;
-@property (nonatomic) BrowserTopBarFocusButton *fullscreenFocusButton;
-@property (nonatomic) BrowserTopBarFocusButton *menuFocusButton;
-@property (nonatomic) BrowserTopBarFocusButton *lastFocusedButton;
-@property (nonatomic, getter=isFocusModeActive) BOOL focusModeActive;
+@property (nonatomic) BrowserTopBarButton *backButton;
+@property (nonatomic) BrowserTopBarButton *forwardButton;
+@property (nonatomic) BrowserTopBarButton *refreshButton;
+@property (nonatomic) BrowserTopBarButton *addressButton;
+@property (nonatomic) BrowserTopBarButton *homeButton;
+@property (nonatomic) BrowserTopBarButton *tabsButton;
+@property (nonatomic) BrowserTopBarButton *fullscreenButton;
+@property (nonatomic) BrowserTopBarButton *menuButton;
+@property (nonatomic) NSArray<BrowserTopBarButton *> *buttons;
+@property (nonatomic, weak) BrowserTopBarButton *lastFocusedButton;
+@property (nonatomic, readwrite, getter=isFocusModeActive) BOOL focusModeActive;
 
 @end
 
@@ -85,6 +334,7 @@ static CGFloat const kTopBarUniformFocusHeight = 72.0;
 - (void)awakeFromNib {
     [super awakeFromNib];
 
+    // The storyboard still contains the legacy image views; the bar is built in code.
     for (UIView *subview in [self.contentView.subviews copy]) {
         if (subview != self.chromeContainerView) {
             [subview removeFromSuperview];
@@ -101,141 +351,70 @@ static CGFloat const kTopBarUniformFocusHeight = 72.0;
 
     self.chromeContainerView = [[UIView alloc] initWithFrame:CGRectZero];
     self.chromeContainerView.backgroundColor = UIColor.clearColor;
-    self.chromeContainerView.userInteractionEnabled = YES;
     self.chromeContainerView.clipsToBounds = NO;
     [self.contentView addSubview:self.chromeContainerView];
 
     self.chromeEffectView = [[UIVisualEffectView alloc] initWithEffect:nil];
-    self.chromeEffectView.userInteractionEnabled = YES;
     self.chromeEffectView.clipsToBounds = YES;
     [self.chromeContainerView addSubview:self.chromeEffectView];
 
-    self.focusGlowView = [[UIView alloc] initWithFrame:CGRectZero];
-    self.focusGlowView.backgroundColor = UIColor.clearColor;
-    self.focusGlowView.userInteractionEnabled = NO;
-    self.focusGlowView.hidden = YES;
-    self.focusGlowView.layer.shadowColor = [UIColor colorWithRed:0.23 green:0.57 blue:1.0 alpha:1.0].CGColor;
-    self.focusGlowView.layer.shadowOffset = CGSizeZero;
-    self.focusGlowView.layer.shadowOpacity = 0.0;
-    self.focusGlowView.layer.shadowRadius = 18.0;
-    [self.chromeContainerView insertSubview:self.focusGlowView belowSubview:self.chromeEffectView];
+    _backButton = [self iconButtonWithSymbol:@"chevron.left" action:BrowserTopBarActionBack label:@"Back"];
+    _forwardButton = [self iconButtonWithSymbol:@"chevron.right" action:BrowserTopBarActionForward label:@"Forward"];
+    _refreshButton = [self iconButtonWithSymbol:@"arrow.clockwise" action:BrowserTopBarActionRefresh label:@"Reload"];
+    _homeButton = [self iconButtonWithSymbol:@"house" action:BrowserTopBarActionHome label:@"Home"];
+    _fullscreenButton = [self iconButtonWithSymbol:@"arrow.up.left.and.arrow.down.right" action:BrowserTopBarActionFullscreen label:@"Hide Top Bar"];
+    _menuButton = [self iconButtonWithSymbol:@"ellipsis" action:BrowserTopBarActionMenu label:@"Menu"];
 
-    self.focusHighlightView = [[UIView alloc] initWithFrame:CGRectZero];
-    self.focusHighlightView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.18];
-    self.focusHighlightView.layer.cornerRadius = 22.0;
-    self.focusHighlightView.alpha = 0.0;
-    self.focusHighlightView.hidden = YES;
-    [self.chromeEffectView.contentView addSubview:self.focusHighlightView];
+    _tabsButton = [BrowserTopBarButton buttonWithStyle:BrowserTopBarButtonStyleTabCount action:BrowserTopBarActionTabs];
+    _tabsButton.accessibilityLabel = @"Tabs";
 
-    _backImageView = [self newIconViewNamed:@"go-back-left-arrow"];
-    _refreshImageView = [self newIconViewNamed:@"refresh-button"];
-    _forwardImageView = [self newIconViewNamed:@"right-arrow-forward"];
-    _homeImageView = [self newIconViewNamed:@"house-outline"];
-    _tabsImageView = [self newIconViewNamed:@"multi-tab"];
-    _fullscreenImageView = [self newIconViewNamed:@"resize-arrows"];
-    _menuImageView = [self newIconViewNamed:@"menu-2"];
+    _addressButton = [BrowserTopBarButton buttonWithStyle:BrowserTopBarButtonStyleAddress action:BrowserTopBarActionURL];
+    _addressButton.accessibilityLabel = @"Enter URL or Search";
 
-    _URLLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-    _URLLabel.text = @"tvOS Browser";
-    _URLLabel.textAlignment = NSTextAlignmentCenter;
-    _URLLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
-    _URLLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
-    _URLLabel.adjustsFontSizeToFitWidth = NO;
-    _URLLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    [self.chromeEffectView.contentView addSubview:_URLLabel];
-
-    _loadingSpinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
-    _loadingSpinner.color = [UIColor colorWithWhite:1.0 alpha:0.92];
-    _loadingSpinner.tintColor = [UIColor colorWithWhite:1.0 alpha:0.92];
-    _loadingSpinner.hidesWhenStopped = YES;
-    [self.chromeEffectView.contentView addSubview:_loadingSpinner];
-
-    NSArray<UIImageView *> *iconViews = @[
-        _backImageView,
-        _refreshImageView,
-        _forwardImageView,
-        _homeImageView,
-        _tabsImageView,
-        _fullscreenImageView,
-        _menuImageView
-    ];
-    for (UIImageView *imageView in iconViews) {
-        [self.chromeEffectView.contentView addSubview:imageView];
-    }
-
-    _backFocusButton = [self newFocusButtonForAction:BrowserTopBarActionBack accessibilityLabel:@"Back"];
-    _refreshFocusButton = [self newFocusButtonForAction:BrowserTopBarActionRefresh accessibilityLabel:@"Reload"];
-    _forwardFocusButton = [self newFocusButtonForAction:BrowserTopBarActionForward accessibilityLabel:@"Forward"];
-    _homeFocusButton = [self newFocusButtonForAction:BrowserTopBarActionHome accessibilityLabel:@"Home"];
-    _tabsFocusButton = [self newFocusButtonForAction:BrowserTopBarActionTabs accessibilityLabel:@"Tabs"];
-    _URLFocusButton = [self newFocusButtonForAction:BrowserTopBarActionURL accessibilityLabel:@"Enter URL or Search"];
-    _fullscreenFocusButton = [self newFocusButtonForAction:BrowserTopBarActionFullscreen accessibilityLabel:@"Top Navigation Visibility"];
-    _menuFocusButton = [self newFocusButtonForAction:BrowserTopBarActionMenu accessibilityLabel:@"Menu"];
-    _focusButtons = @[
-        _backFocusButton,
-        _refreshFocusButton,
-        _forwardFocusButton,
-        _homeFocusButton,
-        _tabsFocusButton,
-        _URLFocusButton,
-        _fullscreenFocusButton,
-        _menuFocusButton
-    ];
-    for (BrowserTopBarFocusButton *button in _focusButtons) {
+    _buttons = @[_backButton, _forwardButton, _refreshButton, _addressButton, _homeButton, _tabsButton, _fullscreenButton, _menuButton];
+    for (BrowserTopBarButton *button in _buttons) {
+        [button addTarget:self action:@selector(handleButtonPrimaryAction:) forControlEvents:UIControlEventPrimaryActionTriggered];
         [self.chromeEffectView.contentView addSubview:button];
     }
 
     [self applyVisualStyle];
-    [self setFocusModeActive:NO];
+    [self setDisplayedURLString:nil];
 }
 
-- (UIImageView *)newIconViewNamed:(NSString *)imageName {
-    UIImageView *imageView = [[UIImageView alloc] initWithImage:[UIImage imageNamed:imageName]];
-    imageView.userInteractionEnabled = NO;
-    imageView.contentMode = UIViewContentModeScaleAspectFit;
-    imageView.alpha = 0.95;
-    return imageView;
-}
-
-- (BrowserTopBarFocusButton *)newFocusButtonForAction:(BrowserTopBarAction)action
-                                   accessibilityLabel:(NSString *)accessibilityLabel {
-    BrowserTopBarFocusButton *button = [BrowserTopBarFocusButton buttonWithType:UIButtonTypeCustom];
-    button.topBarAction = action;
-    button.backgroundColor = UIColor.clearColor;
-    button.hidden = YES;
-    button.enabled = NO;
-    button.accessibilityLabel = accessibilityLabel;
-    button.accessibilityTraits = UIAccessibilityTraitButton;
-    [button addTarget:self action:@selector(handleFocusButtonPrimaryAction:) forControlEvents:UIControlEventPrimaryActionTriggered];
+- (BrowserTopBarButton *)iconButtonWithSymbol:(NSString *)symbolName action:(BrowserTopBarAction)action label:(NSString *)label {
+    BrowserTopBarButton *button = [BrowserTopBarButton buttonWithStyle:BrowserTopBarButtonStyleIcon action:action];
+    button.iconView.image = BrowserTopBarSymbol(symbolName, kTopBarSymbolPointSize);
+    button.accessibilityLabel = label;
     return button;
+}
+
+- (UILabel *)URLLabel {
+    return self.addressButton.textLabel;
+}
+
+- (UIActivityIndicatorView *)loadingSpinner {
+    return self.addressButton.spinner;
 }
 
 - (void)applyVisualStyle {
 #if __has_include(<UIKit/UIGlassEffect.h>)
     if (@available(tvOS 26.0, *)) {
-        self.effect = nil;
-
         UIGlassEffect *glassEffect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
         glassEffect.interactive = YES;
-        glassEffect.tintColor = [UIColor colorWithWhite:1.0 alpha:0.10];
+        glassEffect.tintColor = [UIColor colorWithWhite:0.0 alpha:0.25];
         self.chromeEffectView.effect = glassEffect;
-        self.chromeEffectView.alpha = 1.0;
         self.chromeContainerView.layer.shadowOpacity = 0.0;
-        self.chromeContainerView.layer.shadowOffset = CGSizeZero;
-        self.chromeContainerView.layer.shadowRadius = 0.0;
         self.chromeContainerView.layer.borderWidth = 0.0;
         return;
     }
 #endif
 
-    self.effect = nil;
     self.chromeEffectView.effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
-    self.chromeEffectView.alpha = 0.98;
     self.chromeContainerView.layer.shadowColor = UIColor.blackColor.CGColor;
-    self.chromeContainerView.layer.shadowOpacity = 0.28;
-    self.chromeContainerView.layer.shadowOffset = CGSizeMake(0.0, 12.0);
-    self.chromeContainerView.layer.shadowRadius = 22.0;
-    self.chromeContainerView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.14].CGColor;
+    self.chromeContainerView.layer.shadowOpacity = 0.35;
+    self.chromeContainerView.layer.shadowOffset = CGSizeMake(0.0, 10.0);
+    self.chromeContainerView.layer.shadowRadius = 24.0;
+    self.chromeContainerView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.12].CGColor;
     self.chromeContainerView.layer.borderWidth = 1.0;
 }
 
@@ -250,163 +429,92 @@ static CGFloat const kTopBarUniformFocusHeight = 72.0;
     CGRect chromeFrame = CGRectMake(originX, kTopBarVerticalInset, width, kTopBarHeight);
 
     self.chromeContainerView.frame = chromeFrame;
-    self.chromeContainerView.layer.cornerRadius = chromeFrame.size.height / 2.0;
+    self.chromeContainerView.layer.cornerRadius = kTopBarHeight / 2.0;
     self.chromeContainerView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.chromeContainerView.bounds
-                                                                           cornerRadius:self.chromeContainerView.layer.cornerRadius].CGPath;
-
+                                                                           cornerRadius:kTopBarHeight / 2.0].CGPath;
     self.chromeEffectView.frame = self.chromeContainerView.bounds;
-    self.chromeEffectView.layer.cornerRadius = self.chromeContainerView.layer.cornerRadius;
+    self.chromeEffectView.layer.cornerRadius = kTopBarHeight / 2.0;
 
-    CGFloat iconY = floor((CGRectGetHeight(chromeFrame) - kTopBarIconSize) / 2.0);
-    CGFloat leftX = kTopBarLeadingPadding;
-    NSArray<UIImageView *> *leftIcons = @[
-        self.backImageView,
-        self.refreshImageView,
-        self.forwardImageView,
-        self.homeImageView,
-        self.tabsImageView
-    ];
-    for (UIImageView *imageView in leftIcons) {
-        imageView.frame = CGRectMake(leftX, iconY, kTopBarIconSize, kTopBarIconSize);
-        leftX += kTopBarIconSize + kTopBarIconSpacing;
+    CGFloat buttonY = floor((kTopBarHeight - kTopBarButtonSize) / 2.0);
+    CGFloat x = kTopBarEdgePadding;
+    for (BrowserTopBarButton *button in @[self.backButton, self.forwardButton, self.refreshButton]) {
+        button.frame = CGRectMake(x, buttonY, kTopBarButtonSize, kTopBarButtonSize);
+        x += kTopBarButtonSize + kTopBarButtonSpacing;
     }
+    CGFloat addressMinX = x - kTopBarButtonSpacing + kTopBarClusterSpacing;
 
-    CGFloat rightX = CGRectGetWidth(chromeFrame) - kTopBarTrailingPadding - kTopBarIconSize;
-    self.menuImageView.frame = CGRectMake(rightX, iconY, kTopBarIconSize, kTopBarIconSize);
-
-    rightX = CGRectGetMinX(self.menuImageView.frame) - kTopBarIconSpacing - kTopBarIconSize;
-    self.fullscreenImageView.frame = CGRectMake(rightX, iconY, kTopBarIconSize, kTopBarIconSize);
-
-    CGFloat spinnerSide = 34.0;
-    rightX = CGRectGetMinX(self.fullscreenImageView.frame) - kTopBarSpinnerSpacing - spinnerSide;
-    self.loadingSpinner.frame = CGRectMake(rightX,
-                                           floor((CGRectGetHeight(chromeFrame) - spinnerSide) / 2.0),
-                                           spinnerSide,
-                                           spinnerSide);
-
-    CGFloat labelOriginX = CGRectGetMaxX(self.tabsImageView.frame) + kTopBarLabelSpacing;
-    CGFloat labelTrailingX = CGRectGetMinX(self.loadingSpinner.frame) - kTopBarLabelSpacing;
-    CGFloat labelWidth = MAX(200.0, labelTrailingX - labelOriginX);
-    self.URLLabel.frame = CGRectMake(labelOriginX,
-                                     0.0,
-                                     labelWidth,
-                                     CGRectGetHeight(chromeFrame));
-
-    self.backFocusButton.frame = [self focusFrameForIconView:self.backImageView];
-    self.refreshFocusButton.frame = [self focusFrameForIconView:self.refreshImageView];
-    self.forwardFocusButton.frame = [self focusFrameForIconView:self.forwardImageView];
-    self.homeFocusButton.frame = [self focusFrameForIconView:self.homeImageView];
-    self.tabsFocusButton.frame = [self focusFrameForIconView:self.tabsImageView];
-    self.URLFocusButton.frame = [self focusFrameForLabel:self.URLLabel];
-    self.fullscreenFocusButton.frame = [self focusFrameForIconView:self.fullscreenImageView];
-    self.menuFocusButton.frame = [self focusFrameForMenuIconView:self.menuImageView];
-
-    if (!self.focusModeActive) {
-        [self resetFocusVisualState];
-        return;
+    x = width - kTopBarEdgePadding - kTopBarButtonSize;
+    for (BrowserTopBarButton *button in @[self.menuButton, self.fullscreenButton, self.tabsButton, self.homeButton]) {
+        button.frame = CGRectMake(x, buttonY, kTopBarButtonSize, kTopBarButtonSize);
+        x -= kTopBarButtonSize + kTopBarButtonSpacing;
     }
+    CGFloat addressMaxX = CGRectGetMinX(self.homeButton.frame) - kTopBarClusterSpacing;
 
-    [self updateHighlightFrameForCurrentFocus];
+    self.addressButton.frame = CGRectMake(addressMinX,
+                                          floor((kTopBarHeight - kTopBarAddressHeight) / 2.0),
+                                          MAX(240.0, addressMaxX - addressMinX),
+                                          kTopBarAddressHeight);
 }
+
+#pragma mark Content
+
+- (void)setDisplayedURLString:(NSString *)URLString {
+    BrowserTopBarButton *address = self.addressButton;
+    NSURL *URL = URLString.length > 0 ? [NSURL URLWithString:URLString] : nil;
+    if (URLString.length == 0) {
+        address.showsPlaceholder = YES;
+        address.textLabel.text = kTopBarHomePlaceholder;
+        address.iconView.image = BrowserTopBarSymbol(@"magnifyingglass", 22.0);
+    } else {
+        address.showsPlaceholder = NO;
+        NSString *host = URL.host ?: @"";
+        if ([host.lowercaseString hasPrefix:@"www."]) {
+            host = [host substringFromIndex:4];
+        }
+        NSString *path = URL.path ?: @"";
+        if ([path isEqualToString:@"/"]) {
+            path = @"";
+        }
+        address.textLabel.text = host.length > 0 ? [host stringByAppendingString:path] : URLString;
+        BOOL secure = [URL.scheme.lowercaseString isEqualToString:@"https"];
+        address.iconView.image = host.length > 0 ? BrowserTopBarSymbol(secure ? @"lock.fill" : @"globe", 20.0) : nil;
+    }
+    address.accessibilityValue = URLString.length > 0 ? URLString : kTopBarHomePlaceholder;
+    [address updateAppearanceFocused:address.isFocused];
+    [address setNeedsLayout];
+}
+
+- (void)setBackEnabled:(BOOL)backEnabled forwardEnabled:(BOOL)forwardEnabled {
+    self.backButton.dimmed = !backEnabled;
+    self.forwardButton.dimmed = !forwardEnabled;
+}
+
+- (void)setTabCount:(NSUInteger)tabCount {
+    self.tabsButton.textLabel.text = tabCount > 99 ? @"∞" : [NSString stringWithFormat:@"%lu", (unsigned long)MAX(tabCount, 1)];
+    self.tabsButton.accessibilityValue = [NSString stringWithFormat:@"%lu open", (unsigned long)tabCount];
+}
+
+- (void)setLoadProgress:(double)progress loading:(BOOL)loading animated:(BOOL)animated {
+    [self.addressButton setLoadProgress:progress loading:loading animated:animated];
+}
+
+- (void)setHomeActive:(BOOL)homeActive {
+    self.homeButton.iconView.image = BrowserTopBarSymbol(homeActive ? @"house.fill" : @"house", kTopBarSymbolPointSize);
+}
+
+#pragma mark Focus
 
 - (CGRect)interactiveFrameForView:(UIView *)view {
     return [self convertRect:view.bounds fromView:view];
-}
-
-- (CGRect)uniformFocusFrameForRect:(CGRect)frame horizontalInset:(CGFloat)horizontalInset {
-    CGFloat normalizedHeight = MIN(kTopBarUniformFocusHeight, CGRectGetHeight(self.chromeEffectView.bounds));
-    CGFloat originY = floor((CGRectGetHeight(self.chromeEffectView.bounds) - normalizedHeight) / 2.0);
-    frame.origin.x -= horizontalInset;
-    frame.size.width += horizontalInset * 2.0;
-    frame.origin.y = originY;
-    frame.size.height = normalizedHeight;
-    return CGRectIntegral(frame);
-}
-
-- (CGRect)focusFrameForIconView:(UIView *)view {
-    CGRect frame = view.frame;
-    return [self uniformFocusFrameForRect:frame horizontalInset:12.0];
-}
-
-- (CGRect)focusFrameForMenuIconView:(UIView *)view {
-    return [self focusFrameForIconView:view];
-}
-
-- (CGRect)focusFrameForLabel:(UIView *)view {
-    CGRect frame = view.frame;
-    return [self uniformFocusFrameForRect:frame horizontalInset:16.0];
-}
-
-- (CGRect)highlightFrameForButton:(BrowserTopBarFocusButton *)button {
-    CGRect frame = button.frame;
-    frame = CGRectInset(frame, kTopBarFocusHighlightInset, 0.0);
-    return CGRectIntegral(frame);
-}
-
-- (CGRect)glowFrameForButton:(BrowserTopBarFocusButton *)button {
-    CGRect frame = [self highlightFrameForButton:button];
-    return CGRectInset(frame, -4.0, -4.0);
-}
-
-- (void)ensureFocusGlowViewAttached {
-    if (self.focusGlowView.superview == self.chromeContainerView) {
-        return;
-    }
-    [self.focusGlowView removeFromSuperview];
-    [self.chromeContainerView insertSubview:self.focusGlowView belowSubview:self.chromeEffectView];
-}
-
-- (void)resetFocusVisualState {
-    [self.focusGlowView.layer removeAllAnimations];
-    [self.focusHighlightView.layer removeAllAnimations];
-    self.focusGlowView.hidden = YES;
-    self.focusGlowView.alpha = 0.0;
-    self.focusGlowView.frame = CGRectZero;
-    self.focusGlowView.layer.shadowOpacity = 0.0;
-    self.focusGlowView.layer.shadowPath = nil;
-
-    self.focusHighlightView.hidden = YES;
-    self.focusHighlightView.alpha = 0.0;
-    self.focusHighlightView.frame = CGRectZero;
-
-    [self.focusGlowView removeFromSuperview];
-    [self.layer setNeedsDisplay];
-}
-
-- (void)updateHighlightFrameForCurrentFocus {
-    if (!self.focusModeActive || self.lastFocusedButton == nil || !self.lastFocusedButton.focused) {
-        return;
-    }
-    [self ensureFocusGlowViewAttached];
-    CGRect glowFrame = [self glowFrameForButton:self.lastFocusedButton];
-    self.focusGlowView.hidden = NO;
-    self.focusGlowView.alpha = 1.0;
-    self.focusGlowView.frame = glowFrame;
-    self.focusGlowView.layer.cornerRadius = MIN(CGRectGetHeight(glowFrame) / 2.0, 24.0);
-    self.focusGlowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.focusGlowView.bounds
-                                                                     cornerRadius:self.focusGlowView.layer.cornerRadius].CGPath;
-    self.focusGlowView.layer.shadowOpacity = 0.78;
-    self.focusHighlightView.hidden = YES;
-    self.focusHighlightView.alpha = 0.0;
-    self.focusHighlightView.frame = CGRectZero;
 }
 
 - (void)setFocusModeActive:(BOOL)focusModeActive {
     if (_focusModeActive == focusModeActive) {
         return;
     }
-
     _focusModeActive = focusModeActive;
-    for (BrowserTopBarFocusButton *button in self.focusButtons) {
-        button.hidden = !focusModeActive;
-        button.enabled = focusModeActive;
-    }
-
-    if (!focusModeActive) {
-        self.lastFocusedButton = nil;
-        [self resetFocusVisualState];
-    } else {
-        [self setNeedsLayout];
+    for (BrowserTopBarButton *button in self.buttons) {
+        button.focusable = focusModeActive;
     }
 }
 
@@ -414,55 +522,18 @@ static CGFloat const kTopBarUniformFocusHeight = 72.0;
     if (!self.focusModeActive) {
         return nil;
     }
-    return self.lastFocusedButton ?: self.URLFocusButton;
+    return self.lastFocusedButton ?: self.addressButton;
 }
 
-- (void)handleFocusButtonPrimaryAction:(BrowserTopBarFocusButton *)button {
-    id<BrowserTopBarViewDelegate> delegate = self.delegate;
-    if (delegate == nil) {
-        return;
-    }
-    [delegate browserTopBarView:self didTriggerAction:button.topBarAction];
+- (void)handleButtonPrimaryAction:(BrowserTopBarButton *)button {
+    [self.delegate browserTopBarView:self didTriggerAction:button.topBarAction];
 }
 
 - (void)didUpdateFocusInContext:(UIFocusUpdateContext *)context withAnimationCoordinator:(UIFocusAnimationCoordinator *)coordinator {
     [super didUpdateFocusInContext:context withAnimationCoordinator:coordinator];
-
-    BrowserTopBarFocusButton *nextFocusedButton = [context.nextFocusedView isKindOfClass:[BrowserTopBarFocusButton class]] ? (BrowserTopBarFocusButton *)context.nextFocusedView : nil;
-    BrowserTopBarFocusButton *previousFocusedButton = [context.previouslyFocusedView isKindOfClass:[BrowserTopBarFocusButton class]] ? (BrowserTopBarFocusButton *)context.previouslyFocusedView : nil;
-
-    if (nextFocusedButton != nil) {
-        self.lastFocusedButton = nextFocusedButton;
+    if ([context.nextFocusedView isKindOfClass:[BrowserTopBarButton class]]) {
+        self.lastFocusedButton = (BrowserTopBarButton *)context.nextFocusedView;
     }
-
-    [coordinator addCoordinatedAnimations:^{
-        if (!self.focusModeActive || nextFocusedButton == nil) {
-            self.focusGlowView.alpha = 0.0;
-            self.focusGlowView.layer.shadowOpacity = 0.0;
-            self.focusHighlightView.alpha = 0.0;
-            return;
-        }
-
-        [self ensureFocusGlowViewAttached];
-        CGRect glowFrame = [self glowFrameForButton:nextFocusedButton];
-        self.focusGlowView.hidden = NO;
-        self.focusGlowView.alpha = 1.0;
-        self.focusGlowView.frame = glowFrame;
-        self.focusGlowView.layer.cornerRadius = MIN(CGRectGetHeight(glowFrame) / 2.0, 24.0);
-        self.focusGlowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.focusGlowView.bounds
-                                                                         cornerRadius:self.focusGlowView.layer.cornerRadius].CGPath;
-        self.focusGlowView.layer.shadowRadius = 18.0;
-        self.focusGlowView.layer.shadowOpacity = 0.78;
-        self.focusHighlightView.hidden = YES;
-        self.focusHighlightView.alpha = 0.0;
-        self.focusHighlightView.frame = CGRectZero;
-        previousFocusedButton.alpha = 1.0;
-        nextFocusedButton.alpha = 1.0;
-    } completion:^{
-        if (!self.focusModeActive || nextFocusedButton == nil) {
-            [self resetFocusVisualState];
-        }
-    }];
 }
 
 @end

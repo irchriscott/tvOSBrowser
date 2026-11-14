@@ -10,6 +10,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)webViewDidStartLoad:(id _Nonnull)webView;
 - (void)webViewDidFinishLoad:(id _Nonnull)webView;
 - (void)webView:(id _Nonnull)webView didFailLoadWithError:(NSError * _Nonnull)error;
+/// WebKit's own load state: fires whenever estimated progress or the loading flag changes.
+- (void)webView:(id _Nonnull)webView didChangeLoadProgress:(double)progress loading:(BOOL)loading;
+/// WebKit's page process died (crash or killed for memory). The view shows nothing until reloaded.
+- (void)webViewContentProcessDidTerminate:(id _Nonnull)webView;
 
 @end
 
@@ -22,6 +26,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly, getter=canGoBack) BOOL canGoBack;
 @property (nonatomic, readonly, getter=canGoForward) BOOL canGoForward;
 @property (nonatomic, readonly, getter=isLoading) BOOL loading;
+/// 0.0 to 1.0, as reported by WebKit.
+@property (nonatomic, readonly) double estimatedProgress;
 @property (nonatomic) BOOL scalesPageToFit;
 
 - (instancetype)initWithUserAgent:(NSString * _Nullable)userAgent

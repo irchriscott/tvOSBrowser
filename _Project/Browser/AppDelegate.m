@@ -12,6 +12,15 @@
 
 @interface AppDelegate ()
 
+- (void)restoreCookiesFromDefaults;
+- (void)saveCookiesToDefaults;
+
+@end
+
+@interface BrowserSceneDelegate : UIResponder <UIWindowSceneDelegate>
+
+@property (strong, nonatomic) UIWindow *window;
+
 @end
 
 @implementation AppDelegate
@@ -52,6 +61,13 @@
 	return YES;
 }
 
+- (UISceneConfiguration *)application:(UIApplication *)application
+        configurationForConnectingSceneSession:(UISceneSession *)connectingSceneSession
+                                     options:(UISceneConnectionOptions *)options {
+    return [[UISceneConfiguration alloc] initWithName:@"Default Configuration"
+                                          sessionRole:connectingSceneSession.role];
+}
+
 - (void)applicationWillResignActive:(UIApplication *)application {
 	// Sent when the application is about to move from active to inactive state. This can occur for certain types of temporary interruptions (such as an incoming phone call or SMS message) or when the user quits the application and it begins the transition to the background state.
 	// Use this method to pause ongoing tasks, disable timers, and throttle down OpenGL ES frame rates. Games should use this method to pause the game.
@@ -77,6 +93,30 @@
 - (void)applicationWillTerminate:(UIApplication *)application {
 	// Called when the application is about to terminate. Save data if appropriate. See also applicationDidEnterBackground:.
     [self saveCookiesToDefaults];
+}
+
+@end
+
+@implementation BrowserSceneDelegate
+
+- (AppDelegate *)appDelegate {
+    return (AppDelegate *)UIApplication.sharedApplication.delegate;
+}
+
+- (void)sceneWillResignActive:(UIScene *)scene {
+    [self.appDelegate saveCookiesToDefaults];
+}
+
+- (void)sceneDidEnterBackground:(UIScene *)scene {
+    [self.appDelegate saveCookiesToDefaults];
+}
+
+- (void)sceneWillEnterForeground:(UIScene *)scene {
+    [self.appDelegate restoreCookiesFromDefaults];
+}
+
+- (void)sceneDidBecomeActive:(UIScene *)scene {
+    [self.appDelegate restoreCookiesFromDefaults];
 }
 
 @end

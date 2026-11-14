@@ -58,6 +58,9 @@ static NSString *BrowserPressPhaseString(UIPressPhase phase) {
 @property (nonatomic) CFTimeInterval lastDirectSelectPressTimestamp;
 @property (nonatomic) CFTimeInterval lastSelectPressTimestamp;
 @property (nonatomic) BOOL awaitingSecondSelectPress;
+@property (nonatomic) BOOL hoverCheckScheduled;
+@property (nonatomic) BOOL hoverCheckInProgress;
+@property (nonatomic) BOOL hoverCheckNeedsRerun;
 
 @end
 
@@ -107,9 +110,13 @@ static NSString *BrowserPressPhaseString(UIPressPhase phase) {
     BOOL shouldAllowWebInteraction = !self.cursorModeEnabled &&
         ![self.host browserRemoteInputControllerTabOverviewVisible] &&
         !topBarFocusActive;
-    scrollView.scrollEnabled = shouldAllowWebInteraction;
+    // Scroll mode is driven entirely by manualScrollPanRecognizer (plus inertia).
+    // Letting WebKit scroll too made every swipe move the page twice, made WebKit
+    // render far ahead (crashing heavy pages' content process) and fed remote
+    // touches into WebKit touch handling that tvOS does not support.
+    scrollView.scrollEnabled = NO;
     self.manualScrollPanRecognizer.enabled = shouldAllowWebInteraction;
-    [self.host browserRemoteInputControllerSetWebInteractionEnabled:shouldAllowWebInteraction];
+    [self.host browserRemoteInputControllerSetWebInteractionEnabled:NO];
     self.cursorView.hidden = !self.cursorModeEnabled ||
         [self.host browserRemoteInputControllerTabOverviewVisible] ||
         topBarFocusActive;
@@ -194,6 +201,12 @@ static NSString *BrowserPressPhaseString(UIPressPhase phase) {
     }
 
     [self handleSelectPressEnded];
+}
+
+- (void)suppressGlobalSelectPress {
+    self.lastDirectSelectPressTimestamp = CACurrentMediaTime();
+    self.awaitingSecondSelectPress = NO;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(handleDeferredSelectPressAction) object:nil];
 }
 
 - (void)handleDeferredSelectPressAction {
@@ -428,23 +441,57 @@ static NSString *BrowserPressPhaseString(UIPressPhase phase) {
             self.lastTouchLocation = location;
         }
 
-        self.cursorView.image = BrowserDefaultCursor();
         if ([self.host browserRemoteInputControllerTabOverviewVisible]) {
-            if ([self.host browserRemoteInputControllerTabOverviewContainsPoint:self.cursorView.frame.origin]) {
-                self.cursorView.image = BrowserPointerCursor();
-            }
+            BOOL overCard = [self.host browserRemoteInputControllerTabOverviewContainsPoint:self.cursorView.frame.origin];
+            self.cursorView.image = overCard ? BrowserPointerCursor() : BrowserDefaultCursor();
             break;
         }
         if (self.cursorModeEnabled) {
-            NSString *containsLink = [self.host browserRemoteInputControllerHoverStateAtCursorPoint:self.cursorView.frame.origin];
-            if ([containsLink isEqualToString:@"true"]) {
-                self.cursorView.image = BrowserPointerCursor();
-            }
+            [self scheduleHoverCheck];
         }
         break;
     }
 
     return YES;
+}
+
+/// The link-hover check evaluates JavaScript synchronously, which spins the main
+/// run loop. Doing that inside touchesMoved lets UIKit deliver the next touch
+/// while the first is still being handled, nesting sendEvent: until UIKit aborts
+/// ("sendEvent: nesting level ... exceeded maximum"). Run it after the event has
+/// been handled instead, coalesced so only one check is ever in flight.
+- (void)scheduleHoverCheck {
+    if (self.hoverCheckInProgress) {
+        self.hoverCheckNeedsRerun = YES;
+        return;
+    }
+    if (self.hoverCheckScheduled) {
+        return;
+    }
+    self.hoverCheckScheduled = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self performHoverCheck];
+    });
+}
+
+- (void)performHoverCheck {
+    self.hoverCheckScheduled = NO;
+    if (!self.cursorModeEnabled || [self.host browserRemoteInputControllerTabOverviewVisible]) {
+        return;
+    }
+
+    self.hoverCheckInProgress = YES;
+    NSString *containsLink = [self.host browserRemoteInputControllerHoverStateAtCursorPoint:self.cursorView.frame.origin];
+    self.hoverCheckInProgress = NO;
+
+    if (self.cursorModeEnabled) {
+        self.cursorView.image = [containsLink isEqualToString:@"true"] ? BrowserPointerCursor() : BrowserDefaultCursor();
+    }
+    if (self.hoverCheckNeedsRerun) {
+        // The cursor moved while we were waiting on the page; check its new spot.
+        self.hoverCheckNeedsRerun = NO;
+        [self scheduleHoverCheck];
+    }
 }
 
 - (void)handleTouchesEnded {
