@@ -36,6 +36,9 @@ NS_ASSUME_NONNULL_BEGIN
       allowsInlineMediaPlayback:(BOOL)allowsInlineMediaPlayback NS_DESIGNATED_INITIALIZER;
 
 - (void)loadRequest:(NSURLRequest * _Nullable)request;
+/// YES when `request` is a load the app itself started (address bar, favourites, Home...), as opposed
+/// to a navigation started by the page's scripts.
+- (BOOL)isAppInitiatedRequest:(NSURLRequest * _Nullable)request;
 - (void)reload;
 - (void)goBack;
 - (void)goForward;

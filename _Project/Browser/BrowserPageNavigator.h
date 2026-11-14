@@ -25,6 +25,9 @@ typedef NS_ENUM(NSInteger, BrowserPageNavigationResult) {
 /// that way), and Select activates the highlighted element.
 @interface BrowserPageNavigator : NSObject
 
+/// The page-side navigator; installed on every page ahead of time so the first press is fast.
++ (NSString *)libraryScript;
+
 - (void)moveInDirection:(BrowserPageNavigationDirection)direction
                 webView:(BrowserWebView *)webView
              completion:(nullable void (^)(BrowserPageNavigationResult result))completion;
@@ -41,6 +44,15 @@ typedef NS_ENUM(NSInteger, BrowserPageNavigationResult) {
 
 /// Play/Pause for the page's main video. Completion gets NO when there is no large video.
 - (void)togglePrimaryVideoInWebView:(BrowserWebView *)webView completion:(nullable void (^)(BOOL handled))completion;
+
+/// Presses the highlighted element itself. Returns "clicked", "text" (a text field: the caller
+/// shows the text prompt), "video" (the highlight is a video) or "none". `force` clicks a video too.
+/// Runs synchronously: call it outside of UIKit event handling.
+- (NSString *)activateHighlightInWebView:(BrowserWebView *)webView force:(BOOL)force;
+
+/// Hides the highlight after the user opened the item, but remembers where it was so the next
+/// arrow press continues from there on the same page.
+- (void)releaseHighlightInWebView:(nullable BrowserWebView *)webView;
 
 /// Removes the highlight (e.g. when switching back to cursor mode).
 - (void)clearInWebView:(nullable BrowserWebView *)webView;

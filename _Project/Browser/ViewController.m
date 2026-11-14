@@ -24,6 +24,7 @@
 #import "BrowserVideoPlaybackCoordinator.h"
 #import "BrowserViewModel.h"
 #import "ViewController.h"
+#import "BrowserNativeVideoPlayerViewController.h"
 
 static NSString * const kBrowserGlobalSelectPressEndedNotification = @"BrowserGlobalSelectPressEndedNotification";
 
@@ -240,12 +241,29 @@ static UIColor *kTextColor(void) {
         return;
     }
     [self.pageNavigator wakePageInWebView:self.webview completion:nil];
-    NSValue *point = [self.pageNavigator activationPointInWebView:self.webview];
-    if (point == nil) {
+    // Press the highlighted element itself. (Clicking "whatever is at that spot" could hit the
+    // video behind auto-hidden controls and open the full screen player instead.)
+    NSString *outcome = [self.pageNavigator activateHighlightInWebView:self.webview force:NO];
+    if ([outcome isEqualToString:@"none"]) {
         [self showToast:@"Click the edges of the remote's touch surface to pick a link"];
         return;
     }
-    [self.pageActionCoordinator handlePageSelectionAtDOMPoint:point.CGPointValue webView:self.webview];
+    if ([outcome isEqualToString:@"text"]) {
+        // Text fields get the on-screen keyboard prompt, which works from a page point.
+        NSValue *point = [self.pageNavigator activationPointInWebView:self.webview];
+        if (point != nil) {
+            [self.pageActionCoordinator handlePageSelectionAtDOMPoint:point.CGPointValue webView:self.webview];
+        }
+    } else if ([outcome isEqualToString:@"video"]) {
+        // The highlight is the video itself: the full screen player if enabled, otherwise a click.
+        NSValue *point = [self.pageNavigator activationPointInWebView:self.webview];
+        BOOL handled = point != nil && [self.videoPlaybackCoordinator handleSelectPressForVideoAtDOMPoint:point.CGPointValue];
+        if (!handled) {
+            [self.pageNavigator activateHighlightInWebView:self.webview force:YES];
+        }
+    }
+    // The item was opened: remove its highlight (a new page must not show the old ring).
+    [self.pageNavigator releaseHighlightInWebView:self.webview];
 }
 
 - (BrowserWebView *)webview {
@@ -957,7 +975,17 @@ static UIColor *kTextColor(void) {
 }
 
 - (BOOL)webView:(id)webView shouldStartLoadWithRequest:(NSURLRequest *)request navigationType:(NSInteger)navigationType {
-    (void)navigationType;
+    BrowserAdBlocker *blocker = [BrowserAdBlocker sharedBlocker];
+    BOOL mainFrame = request.mainDocumentURL == nil || [request.URL isEqual:request.mainDocumentURL];
+    if (blocker.enabled && mainFrame && navigationType != 2 && navigationType != 3 &&
+        ([blocker isBlockedURL:request.URL] || [blocker isSuspiciousAdDomainURL:request.URL]) &&
+        ![webView isAppInitiatedRequest:request] &&
+        ![[webView request].URL.host isEqualToString:request.URL.host]) {
+        // A page script tried to send the tab to an ad site (click hijacking).
+        NSLog(@"[Browser] Ad blocker: blocked redirect to %@", request.URL.host);
+        [self showToast:@"Blocked a redirect to an ad site"];
+        return NO;
+    }
     [self.tabCoordinator prepareTabForRequest:request webView:webView];
     return YES;
 }
@@ -990,6 +1018,49 @@ static UIColor *kTextColor(void) {
     [self.tabCoordinator webViewContentProcessDidTerminate:webView];
 }
 
+- (void)runNavigationBenchmarkIfRequested:(id)webView {
+    // Launch with -BrowserNavBenchmark YES: 12 rapid arrow presses, timing each from press to result.
+    static BOOL ranOnce = NO;
+    if (ranOnce || ![[NSUserDefaults standardUserDefaults] boolForKey:@"BrowserNavBenchmark"] || webView != self.webview) {
+        return;
+    }
+    ranOnce = YES;
+    NSArray<NSNumber *> *pattern = @[@1, @1, @3, @3, @1, @2, @1, @1, @0, @3, @1, @0];
+    NSArray<NSString *> *names = @[@"up", @"down", @"left", @"right"];
+    __block NSUInteger index = 0;
+    __block void (^next)(void);
+    __block NSMutableArray<NSNumber *> *times = [NSMutableArray array];
+    __weak typeof(self) weakSelf = self;
+    next = ^{
+        if (index >= pattern.count) {
+            double total = 0, worst = 0;
+            for (NSNumber *t in times) { total += t.doubleValue; worst = MAX(worst, t.doubleValue); }
+            printf("[BBENCH] %lu presses: average %.0f ms, worst %.0f ms\n", (unsigned long)times.count, total / MAX(times.count, 1), worst);
+            fflush(stdout);
+            next = nil;
+            return;
+        }
+        NSInteger direction = pattern[index].integerValue;
+        index++;
+        CFTimeInterval start = CACurrentMediaTime();
+        [weakSelf.pageNavigator moveInDirection:(BrowserPageNavigationDirection)direction webView:weakSelf.webview completion:^(BrowserPageNavigationResult result) {
+            double ms = (CACurrentMediaTime() - start) * 1000.0;
+            [times addObject:@(ms)];
+            [weakSelf.webview evaluateJavaScript:@"(function(){var e=window.__bnav&&window.__bnav.current; if(!e){return 'none';} var r=e.getBoundingClientRect(); var hit=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2); return e.tagName+' '+JSON.stringify((e.innerText||e.getAttribute('aria-label')||'').trim().slice(0,28))+' '+Math.round(r.width)+'x'+Math.round(r.height)+' visibleAtCentre='+(!!hit&&(hit===e||e.contains(hit)||hit.contains(e)));})()" completionHandler:^(id description, __unused NSError *error) {
+                printf("[BBENCH] %-5s %4.0f ms result=%ld -> %s\n", names[direction].UTF8String, ms, (long)result, [[description description] UTF8String]);
+                fflush(stdout);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+            }];
+        }];
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(24.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSString *dump = [weakSelf.webview stringByEvaluatingJavaScriptFromString:@"(function(){var els=document.querySelectorAll('button,a[href],video,[role=button]'); var out=[]; for(var i=0;i<els.length&&out.length<14;i++){var e=els[i]; var r=e.getBoundingClientRect(); var cs=getComputedStyle(e); out.push(e.tagName+' '+JSON.stringify((e.getAttribute('aria-label')||e.innerText||'').trim().slice(0,16))+' '+Math.round(r.left)+','+Math.round(r.top)+' '+Math.round(r.width)+'x'+Math.round(r.height)+' op='+cs.opacity+' vis='+cs.visibility+' disp='+cs.display+' pe='+cs.pointerEvents+' conn='+e.isConnected);} return 'count='+els.length+' video='+document.querySelectorAll('video').length+'\\n  '+out.join('\\n  ');})()"];
+        printf("[BBENCH] page elements before pressing:\n  %s\n", dump.UTF8String ?: "(nil)");
+        fflush(stdout);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+}
+
 - (void)runNavigationDiagnosticsIfRequested:(id)webView {
     // Launch with -BrowserNavDiagnostics YES: simulates remote arrow presses and logs the highlighted element.
     static BOOL ranOnce = NO;
@@ -1007,7 +1078,8 @@ static UIColor *kTextColor(void) {
         fflush(stdout);
         [self activateHighlightedPageElement];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            printf("[BNAV] after select: tab is at %s\n", self.webview.request.URL.absoluteString.UTF8String);
+            NSString *ring = [self.webview stringByEvaluatingJavaScriptFromString:@"(function(){return (document.querySelector('[data-browser-focus-ring]') ? 'ring STILL SHOWN' : 'no ring') + ' at ' + location.href;})()"];
+            printf("[BNAV] after select: %s\n", ring.UTF8String ?: "(page busy)");
             fflush(stdout);
         });
     });
@@ -1066,13 +1138,105 @@ static UIColor *kTextColor(void) {
     NSString *videoState = @"(function(){var v=document.querySelector('video'); if(!v){return 'no video';} return 'src='+String(v.currentSrc).slice(-40)+' size='+v.videoWidth+'x'+v.videoHeight+' rs='+v.readyState+' paused='+v.paused+' t='+v.currentTime.toFixed(1)+' fsElement='+((document.fullscreenElement||document.webkitFullscreenElement||{}).tagName||'none')+' presentation='+v.webkitPresentationMode+' rect='+Math.round(v.getBoundingClientRect().width)+'x'+Math.round(v.getBoundingClientRect().height);})()";
     NSString *menuText = @"(function(){var out=[]; var els=document.querySelectorAll('[role=menu] *,[role=dialog] *,[class*=menu] *,[class*=settings] *,[class*=popover] *,[class*=panel] *'); for(var i=0;i<els.length;i++){var e=els[i]; if(e.children.length){continue;} var r=e.getBoundingClientRect(); if(r.width<2||r.height<2){continue;} var t=(e.innerText||'').trim(); if(t&&out.indexOf(t)===-1){out.push(t);}} return JSON.stringify(out.slice(0,40));})()";
     NSString *mode = [[NSUserDefaults standardUserDefaults] stringForKey:@"BrowserPlayerTestMode"] ?: @"fullscreen";
-    NSArray *steps = [mode isEqualToString:@"native"] ? @[
-        @[@0.0, @"start", @"(function(){var v=document.querySelector('video'); if(v){v.play();} return 'play() called';})()"],
+    NSString *subtitleState = @"(function(){var v=document.querySelector('video'); var tt=[]; if(v&&v.textTracks){for(var i=0;i<v.textTracks.length;i++){var t=v.textTracks[i]; if(t.mode!=='disabled'){tt.push(t.label+'/'+t.language+':'+t.mode+':cues='+(t.cues?t.cues.length:'null')+':active='+(t.activeCues?t.activeCues.length:'null'));}}} var fsEl=document.querySelector('[data-browser-fullscreen]'); var overlays=[].filter.call(document.querySelectorAll('[class*=subtitle],[class*=caption],[class*=cue],[class*=Subtitle]'),function(e){return e.children.length<4&&e.innerText&&e.innerText.trim().length>0;}).map(function(e){var r=e.getBoundingClientRect(); var cs=getComputedStyle(e); var hit=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2); return String(e.className).slice(0,50)+' text='+JSON.stringify(e.innerText.trim().slice(0,30))+' rect='+Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+'x'+Math.round(r.height)+' vis='+cs.visibility+'/'+cs.display+'/'+cs.opacity+' covered='+(!!hit&&hit!==e&&!e.contains(hit))+' insideFS='+(fsEl?fsEl.contains(e):'n/a');}); var lp=document.querySelector('.lp-subtitle'); var lpBox=lp?lp.parentElement:null; var lpInfo=lpBox?('container vis='+getComputedStyle(lpBox).visibility+'/'+getComputedStyle(lpBox).display+'/'+getComputedStyle(lpBox).opacity):'no lp-subtitle element'; return JSON.stringify({videoClass:v?String(v.className):'', lp:lpInfo, activeTracks:tt, overlays:overlays.slice(0,4), fsElement:fsEl?(fsEl.tagName+'.'+String(fsEl.className).slice(0,50)):'none', displayingFS:v&&v.webkitDisplayingFullscreen, t:v&&v.currentTime.toFixed(1), paused:v&&v.paused});})()";
+    NSString *subLogger = @"(function(){window.__subLog=[]; window.__subLast=''; clearInterval(window.__subTimer); window.__subTimer=setInterval(function(){var s=document.querySelector('.lp-subtitle, [class*=subtitle-text], [class*=captions-text], .vjs-text-track-display, .jw-captions, .plyr__captions'); var t=s?(s.innerText||'').trim():''; var fsEl=document.fullscreenElement; var key=t+'|'+(!!fsEl); if(key===window.__subLast){return;} window.__subLast=key; var info=''; if(s){var r=s.getBoundingClientRect(); var cs=getComputedStyle(s); var hit=t?document.elementFromPoint(r.left+r.width/2,r.top+r.height/2):null; info=' box='+Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+'x'+Math.round(r.height)+' vis='+cs.visibility+'/'+cs.opacity+'/'+cs.display+(t?' topElement='+(hit?(hit===s||s.contains(hit)?'subtitle':hit.tagName+'.'+String(hit.className).slice(0,30)):'none'):'')+' insideFS='+(fsEl?fsEl.contains(s):'-');} var v=document.querySelector('video'); window.__subLog.push((v?v.currentTime.toFixed(1):'?')+'s fs='+(fsEl?fsEl.tagName+'.'+String(fsEl.className).slice(0,15):'none')+' text='+JSON.stringify(t.slice(0,34))+info);},250); return 'subtitle recorder on';})()";
+    __unused NSString *ensureEnglish = @"(function(){var had=(window.__subLog||[]).some(function(l){return l.indexOf('text=\\\"\\\"')===-1;}); if(had){return 'subtitles already showing';} var b=document.querySelector('button[aria-label=Subtitles]'); if(!b){return 'no Subtitles button';} b.click(); var items=document.querySelectorAll('.menu-link'); for(var i=0;i<items.length;i++){if(/^English/.test((items[i].innerText||'').trim())){items[i].click(); break;}} setTimeout(function(){b.click();},400); return 'turned English on';})()";
+    NSString *enterFullscreen = @"(function(){var b=document.querySelector('button[aria-label=Fullscreen], button[aria-label*=ullscreen], [class*=fullscreen] button, button[class*=fullscreen]'); if(!b){return 'no fullscreen button';} b.click(); return 'fullscreen button click() on '+(b.getAttribute('aria-label')||b.className);})()";
+    NSString *allVideos = @"(function(){return [].map.call(document.querySelectorAll('video'),function(v){return String(v.currentSrc||v.src).slice(-60)+' rs='+v.readyState+' paused='+v.paused+' t='+v.currentTime.toFixed(1)+' muted='+v.muted+' err='+(v.error?v.error.code:'-')+' '+Math.round(v.getBoundingClientRect().width)+'x'+Math.round(v.getBoundingClientRect().height);}).join(' | ')+' || iframes='+[].map.call(document.querySelectorAll('iframe'),function(f){return (f.src||'(no src)').slice(0,60)+' '+Math.round(f.getBoundingClientRect().width)+'x'+Math.round(f.getBoundingClientRect().height);}).join(',')+' || url='+location.href;})()";
+    NSArray *siteSteps = @[
+        @[@0.0, @"click", @"^play$"],
+        @[@10.0, @"videos", allVideos],
+        @[@16.0, @"videos", allVideos],
+        @[@17.0, @"start", @"(function(){var out=[]; var els=document.querySelectorAll('button,[role=button]'); for(var i=0;i<els.length;i++){var e=els[i]; var r=e.getBoundingClientRect(); if(r.width<4){continue;} var l=(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').trim().replace(/\\s+/g,' ').slice(0,24); if(l){out.push(l);}} return 'player buttons: '+JSON.stringify(out.slice(0,30));})()"],
+        @[@17.5, @"videos", @"(function(){var out=[]; var els=document.querySelectorAll('button,[role=button],[class*=control] *'); for(var i=0;i<els.length;i++){var e=els[i]; var d=((e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')+' '+String(e.className||'')+' '+(e.getAttribute('data-tip')||'')+' '+(e.innerText||'').slice(0,20)).toLowerCase(); if(/full|screen|expand|sub|caption|\\bcc\\b|track|setting/.test(d)){var r=e.getBoundingClientRect(); out.push(e.tagName+' ['+d.replace(/\\s+/g,' ').trim().slice(0,70)+'] '+Math.round(r.left)+','+Math.round(r.top)+' '+Math.round(r.width)+'x'+Math.round(r.height));}} return 'fullscreen/subtitle-ish controls: '+out.slice(0,25).join(' ;; ');})()"],
+        @[@18.0, @"fullscreen-retry", enterFullscreen],
+        @[@21.0, @"videos", allVideos],
+        @[@22.0, @"state", @"(function(){return 'fullscreenElement='+((document.fullscreenElement||{}).className||'none');})()"],
+    ];
+    NSArray *nativeSubtitleSteps = @[
+        @[@0.0, @"start", @"(function(){var v=document.querySelector('video'); if(!v){return 'no video';} v.currentTime=225; var p=v.play(); if(p&&p.catch){p.catch(function(){});} return 'seeked to 225 + play';})()"],
+        @[@3.0, @"click", @"^subtitles$"],
+        @[@5.0, @"click", @"^off$"],
+        @[@7.0, @"click", @"^english"],
+        @[@9.0, @"click", @"^subtitles$"],
+        @[@11.0, @"start", @"(function(){var s=window.__browserSubtitles; return s ? ('captured subtitle file: '+s.url.slice(0,70)+' ('+s.text.length+' chars)') : 'no subtitle file captured';})()"],
+        @[@12.0, @"native-player", @""],
+        @[@20.0, @"native-subs", @""],
+        @[@23.0, @"native-subs", @""],
+        @[@26.0, @"native-subs", @""],
+        @[@29.0, @"native-subs", @""],
+    ];
+    NSString *subtitleProbe = @"(function(){var v=null,best=0; [].forEach.call(document.querySelectorAll('video'),function(x){var r=x.getBoundingClientRect(); if(r.width*r.height>best){best=r.width*r.height; v=x;}}); var tracks=[]; if(v&&v.textTracks){for(var i=0;i<v.textTracks.length;i++){var t=v.textTracks[i]; tracks.push((t.label||t.language||'?')+':'+t.mode+':'+(t.cues?t.cues.length:'-'));}} var cap=window.__browserSubtitles; var subEls=[].filter.call(document.querySelectorAll('[class*=subtitle],[class*=caption],[class*=Subtitle],[class*=cue]'),function(e){return e.innerText&&e.innerText.trim();}).map(function(e){return String(e.className).slice(0,30)+'='+JSON.stringify(e.innerText.trim().slice(0,30));}); var menu=[].filter.call(document.querySelectorAll('button,[role=menuitem],li'),function(e){return /subtit|caption|english|\\bcc\\b/i.test((e.getAttribute('aria-label')||'')+' '+(e.innerText||''));}).map(function(e){return (e.getAttribute('aria-label')||e.innerText||'').trim().slice(0,20);}); return 'video t='+(v?v.currentTime.toFixed(1):'-')+' paused='+(v?v.paused:'-')+' | tracks='+JSON.stringify(tracks.slice(0,6))+' ('+tracks.length+') | captured='+(cap?cap.url.slice(0,60)+' '+cap.text.length+'ch':'none')+' | on-screen='+JSON.stringify(subEls.slice(0,3))+' | subtitle controls='+JSON.stringify(menu.slice(0,8));})()";
+    NSArray *movySteps = @[
+        @[@0.0, @"click", @"^play$"],
+        @[@9.0, @"start", @"(function(){var v=null,best=0; [].forEach.call(document.querySelectorAll('video'),function(x){var r=x.getBoundingClientRect(); if(r.width*r.height>best){best=r.width*r.height; v=x;}}); if(v&&v.paused){var p=v.play(); if(p&&p.catch){p.catch(function(){});}} return 'play main video';})()"],
+        @[@15.0, @"videos", subtitleProbe],
+        @[@25.0, @"videos", @"(function(){var c=window.__browserSubtitles; return c ? ('captured starts: '+JSON.stringify(c.text.slice(0,160))) : 'none';})()"],
+    ];
+    NSString *adReport = @"(function(){var hosts={}; performance.getEntriesByType('resource').forEach(function(e){try{var h=new URL(e.name).host; if(h.indexOf(location.host.replace(/^www\\./,''))===-1){hosts[h]=(hosts[h]||0)+1;}}catch(x){}}); var top=[].filter.call(document.querySelectorAll('html > *, body > *'),function(el){var cs=getComputedStyle(el); return (cs.position==='fixed'||cs.position==='absolute')&&(parseInt(cs.zIndex,10)||0)>=2147480000;}).map(function(el){return el.tagName+'.'+String(el.className).slice(0,20);}); var scam=document.body&&/Confirmation required|payment methods/i.test(document.documentElement.innerText||''); return 'overlay ads removed='+(window.__browserAdsRemoved||0)+' | max-layer overlays now='+JSON.stringify(top)+' | fake payment alert visible='+scam+' | third-party hosts loaded='+JSON.stringify(Object.keys(hosts));})()";
+    NSString *injectFakeAd = @"(function(){var wrap=document.createElement('div'); wrap.style.cssText='position:fixed;inset:0;z-index:2147483647;'; var inner=document.createElement('div'); inner.className='notranslate'; var frame=document.createElement('iframe'); frame.setAttribute('sandbox','allow-same-origin allow-scripts allow-popups'); frame.style.cssText='width:468px;height:238px;border:0;'; inner.appendChild(frame); wrap.appendChild(inner); document.documentElement.appendChild(wrap); try{frame.contentDocument.body.innerHTML='<div>Confirmation required</div>';}catch(e){} return 'injected a simulated fake-alert overlay (unknown ad domain case)';})()";
+    NSString *injectLegitDialog = @"(function(){var d=document.createElement('div'); d.id='legit-site-dialog'; d.style.cssText='position:fixed;left:40%;top:40%;width:400px;height:200px;z-index:9999;background:#222;color:#fff;'; d.textContent='Site dialog'; document.body.appendChild(d); return 'injected a normal site dialog (z-index 9999)';})()";
+    NSArray *adSteps = @[
+        @[@0.0, @"videos", adReport],
+        @[@5.0, @"start", injectFakeAd],
+        @[@5.2, @"start", injectLegitDialog],
+        @[@7.0, @"videos", adReport],
+        @[@7.5, @"start", @"(function(){return 'normal site dialog still present='+!!document.getElementById('legit-site-dialog');})()"],
+    ];
+    NSString *playState = @"(function(){var v=null,best=0; [].forEach.call(document.querySelectorAll('video'),function(x){var r=x.getBoundingClientRect(); if(r.width*r.height>best){best=r.width*r.height; v=x;}}); var cur=window.__bnav&&window.__bnav.current; return 'main video '+(v?(String(v.currentSrc).slice(-34)+' paused='+v.paused+' t='+v.currentTime.toFixed(1)):'none')+' | highlight='+(cur?(cur.tagName+' '+JSON.stringify((cur.getAttribute('aria-label')||cur.innerText||'').trim().slice(0,24))):'none');})()";
+    NSArray *playClickSteps = @[
+        @[@0.0, @"click", @"^play$"],
+        @[@8.0, @"videos", playState],
+        @[@8.5, @"presented-state", @""],
+        @[@9.0, @"nav-to-play-control", @""],
+        @[@14.0, @"videos", playState],
+        @[@14.5, @"select-highlight", @""],
+        @[@17.0, @"videos", playState],
+        @[@17.5, @"presented-state", @""],
+    ];
+    NSArray *steps = [mode isEqualToString:@"playclick"] ? playClickSteps : [mode isEqualToString:@"ads"] ? adSteps : [mode isEqualToString:@"movy-subs"] ? movySteps : [mode isEqualToString:@"native-subtitles"] ? nativeSubtitleSteps : [mode isEqualToString:@"site"] ? siteSteps : [mode isEqualToString:@"subtitles2"] ? @[
+        @[@0.0, @"start", @"(function(){var v=document.querySelector('video'); if(!v){return 'no video';} v.currentTime=225; var p=v.play(); if(p&&p.catch){p.catch(function(){});} return 'seeked to 225 + play';})()"],
+        @[@1.0, @"start", subLogger],
+        @[@3.0, @"click", @"^subtitles$"],
+        @[@5.0, @"click", @"^off$"],
+        @[@7.0, @"click", @"^english"],
+        @[@9.0, @"click", @"^subtitles$"],
+        @[@24.0, @"fullscreen-retry", enterFullscreen],
+        @[@46.0, @"start", @"(function(){return 'LOG\\n'+(window.__subLog||[]).join('\\n');})()"],
+    ] : [mode isEqualToString:@"subtitles"] ? @[
+        @[@0.0, @"start", @"(function(){var v=document.querySelector('video'); if(v&&v.paused){var p=v.play(); if(p&&p.catch){p.catch(function(){});}} return 'play() called';})()"],
+        @[@2.0, @"start", @"(function(){var v=document.querySelector('video'); if(!v){return 'no video';} v.currentTime=228; if(v.paused){v.muted=true; v.play(); return 'seeked to 228, retried muted';} return 'seeked to 228, playing';})()"],
+        @[@3.0, @"start", @"(function(){var b=document.querySelector('button[aria-label=Subtitles]'); if(b){b.click();} return 'subtitles menu opened';})()"],
+        @[@5.0, @"start", @"(function(){var items=document.querySelectorAll('.menu-link'); for(var i=0;i<items.length;i++){var t=(items[i].innerText||'').trim(); if(/^English/.test(t)){ if(/selected/.test(items[i].className)){return 'English already selected';} items[i].click(); return 'English selected now';}} return 'English item not found';})()"],
+        @[@7.0, @"start", @"(function(){var b=document.querySelector('button[aria-label=Subtitles]'); if(b){b.click();} return 'subtitles menu toggled closed';})()"],
+        @[@8.0, @"start", @"(function(){var sel=[].filter.call(document.querySelectorAll('.menu-link.selected'),function(e){return (e.innerText||'').trim();}).map(function(e){return e.innerText.trim().slice(0,20);}); return 'selected items: '+JSON.stringify(sel);})()"],
+        @[@10.0, @"subs", subtitleState],
+        @[@12.0, @"subs", subtitleState],
+        @[@14.0, @"subs", subtitleState],
+        @[@14.5, @"dump", @"(function(){function d(e){var out=[]; for(var k=0;k<7&&e;k++){out.push(e.tagName+'.'+String(e.className).replace(/\\s+/g,'.').slice(0,45)); e=e.parentElement;} return out.join(' < ');} var b=document.querySelector('button[aria-label=Fullscreen]'); var r=b.getBoundingClientRect(); var hit=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2); var v=document.querySelector('video'); var vr=v.getBoundingClientRect(); var node=v.parentElement, best=v; for(var i=0;node&&node!==document.body&&i<4;i++,node=node.parentElement){var nr=node.getBoundingClientRect(); if(nr.width*nr.height>Math.max(1,vr.width*vr.height)*1.6){break;} best=node;} var sub=document.querySelector('.lp-subtitle'); return 'HIT@fullscreen: '+d(hit)+' || buttonIsHit='+(hit===b||b.contains(hit))+' || FS-CONTAINER(webkitEnterFullscreen): '+d(best)+' || SUBTITLE: '+(sub?d(sub):'none (between lines)')+' || subtitleInsideContainer='+(sub?best.contains(sub):'n/a')+' || VIDEO parent chain: '+d(v);})()"],
+        @[@15.0, @"hover-fullscreen", @""],
+        @[@16.0, @"start", @"(function(){var b=document.querySelector('button[aria-label=Fullscreen]'); if(!b){return 'no button';} b.click(); return 'Fullscreen button click() called';})()"],
+        @[@18.0, @"subs", subtitleState],
+        @[@19.5, @"subs", subtitleState],
+        @[@21.0, @"subs", subtitleState],
+        @[@22.5, @"subs", subtitleState],
+        @[@24.0, @"subs", subtitleState],
+        @[@25.5, @"subs", subtitleState],
+        @[@27.0, @"subs", subtitleState],
+        @[@28.5, @"subs", subtitleState],
+    ] : [mode isEqualToString:@"native"] ? @[
+        @[@0.0, @"click", @"^play$"],
+        @[@0.5, @"start", @"(function(){var v=document.querySelector('video'); if(v&&v.paused){v.play();} return 'play() called';})()"],
         @[@6.0, @"state", videoState],
         @[@7.0, @"native-player", @""],
         @[@15.0, @"native-state", @""],
-        @[@23.0, @"native-state", @""],
-        @[@31.0, @"native-state", @""],
+        @[@16.0, @"native-quality", @"480"],
+        @[@22.0, @"native-state", @""],
+        @[@26.0, @"native-state", @""],
+        @[@27.0, @"native-quality", @"1080"],
+        @[@33.0, @"native-state", @""],
+        @[@37.0, @"native-state", @""],
+        @[@38.0, @"native-quality", @"__restore__"],
     ] : @[
         @[@0.0, @"start", @"(function(){var v=document.querySelector('video'); if(v){v.play();} return 'play() called';})()"],
         @[@6.0, @"state", videoState],
@@ -1083,8 +1247,29 @@ static UIColor *kTextColor(void) {
         @[@15.0, @"menu-press", @""],
         @[@17.0, @"state", videoState],
     ];
+    [self diagnosticsWhenVideoReady:0 run:^{
+        [self diagnosticsScheduleSteps:steps mode:mode];
+    }];
+}
+
+/// Polls until the page has a video that can play (or ~45s pass), then runs `block`.
+- (void)diagnosticsWhenVideoReady:(NSUInteger)attempt run:(void (^)(void))block {
+    NSString *ready = [self.webview stringByEvaluatingJavaScriptFromString:@"(function(){var v=document.querySelector('video'); return v && v.readyState >= 2 ? 'yes' : 'no';})()"];
+    if ([ready isEqualToString:@"yes"] || attempt >= 45) {
+        printf("[BQUAL] video ready after %lus\n", (unsigned long)attempt);
+        fflush(stdout);
+        block();
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self diagnosticsWhenVideoReady:attempt + 1 run:block];
+    });
+}
+
+- (void)diagnosticsScheduleSteps:(NSArray *)steps mode:(NSString *)mode {
     for (NSArray *step in steps) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((10.0 + [step[0] doubleValue]) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        double baseDelay = 1.0;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((baseDelay + [step[0] doubleValue]) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if ([step[1] isEqualToString:@"click"]) {
                 printf("[BQUAL] %s\n", [self diagnosticsClickElementMatching:step[2]].UTF8String);
                 fflush(stdout);
@@ -1097,13 +1282,69 @@ static UIColor *kTextColor(void) {
                 NSString *after = [self.webview stringByEvaluatingJavaScriptFromString:@"(function(){var b=document.querySelector('button[aria-label=Fullscreen]'); return b ? getComputedStyle(b).opacity+','+getComputedStyle(b.parentElement).opacity : '';})()"];
                 printf("[BQUAL] cursor moved over Fullscreen button (x,y,opacity,barOpacity before=%s; after=%s)\n", where.UTF8String ?: "", after.UTF8String ?: "");
                 fflush(stdout);
+            } else if ([step[1] isEqualToString:@"fullscreen-retry"]) {
+                NSString *result = nil;
+                for (NSUInteger attempt = 0; attempt < 4; attempt++) {
+                    [self.pageNavigator wakePageInWebView:self.webview completion:nil];
+                    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.6]];
+                    result = [self.webview stringByEvaluatingJavaScriptFromString:step[2]];
+                    if (result.length > 0 && ![result hasPrefix:@"no "]) {
+                        break;
+                    }
+                }
+                printf("[BQUAL] start %s\n", result.UTF8String ?: "(nil)");
+                fflush(stdout);
+            } else if ([step[1] isEqualToString:@"presented-state"]) {
+                printf("[BQUAL] presented=%s\n", self.presentedViewController ? NSStringFromClass(self.presentedViewController.class).UTF8String : "(none)");
+                fflush(stdout);
+            } else if ([step[1] isEqualToString:@"nav-to-play-control"]) {
+                [self.remoteInputController setCursorModeEnabled:NO];
+                __block NSUInteger presses = 0;
+                __block void (^pressDown)(void);
+                __weak typeof(self) weakSelf = self;
+                pressDown = ^{
+                    [weakSelf.pageNavigator moveInDirection:(presses < 6 ? BrowserPageNavigationDirectionDown : BrowserPageNavigationDirectionLeft) webView:weakSelf.webview completion:^(BrowserPageNavigationResult result) {
+                        NSString *label = [weakSelf.webview stringByEvaluatingJavaScriptFromString:@"(function(){var e=window.__bnav&&window.__bnav.current; return e?((e.getAttribute('aria-label')||e.innerText||e.tagName)+'').trim().slice(0,30):'';})()"];
+                        printf("[BQUAL] nav press %lu -> %s\n", (unsigned long)presses + 1, label.UTF8String ?: "");
+                        fflush(stdout);
+                        presses++;
+                        if (presses < 9 && ![label.lowercaseString hasPrefix:@"play"] && ![label.lowercaseString hasPrefix:@"pause"]) {
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), pressDown);
+                        } else {
+                            pressDown = nil;
+                        }
+                    }];
+                };
+                pressDown();
+            } else if ([step[1] isEqualToString:@"select-highlight"]) {
+                NSValue *point = [self.pageNavigator activationPointInWebView:self.webview];
+                NSString *hit = point ? [self.webview stringByEvaluatingJavaScriptFromString:[NSString stringWithFormat:@"(function(){var h=document.elementFromPoint(%f,%f); return h?(h.tagName+'.'+String(h.className).slice(0,30)+' label='+((h.closest&&h.closest('button,[role=button]'))?(h.closest('button,[role=button]').getAttribute('aria-label')||''):'')):'none';})()", point.CGPointValue.x, point.CGPointValue.y]] : @"no point";
+                printf("[BQUAL] Select on highlight: point=%s element there=%s\n", point ? NSStringFromCGPoint(point.CGPointValue).UTF8String : "nil", hit.UTF8String ?: "");
+                fflush(stdout);
+                [self activateHighlightedPageElement];
+            } else if ([step[1] isEqualToString:@"native-subs"]) {
+                UIViewController *player = self.presentedViewController;
+                UILabel *label = [player respondsToSelector:NSSelectorFromString(@"subtitleLabel")] ? [player valueForKey:@"subtitleLabel"] : nil;
+                NSArray *cues = [player respondsToSelector:NSSelectorFromString(@"subtitleCues")] ? [player valueForKey:@"subtitleCues"] : nil;
+                double t = [player isKindOfClass:[AVPlayerViewController class]] ? CMTimeGetSeconds(((AVPlayerViewController *)player).player.currentTime) : -1;
+                printf("[BQUAL] native player t=%.1f cues=%lu subtitle on screen: \"%s\"\n", t, (unsigned long)cues.count, [[label.text stringByReplacingOccurrencesOfString:@"\n" withString:@" / "] UTF8String] ?: "");
+                fflush(stdout);
+            } else if ([step[1] isEqualToString:@"videos"]) {
+                printf("[BQUAL] videos %s\n", [self.webview stringByEvaluatingJavaScriptFromString:step[2]].UTF8String ?: "(nil)");
+                fflush(stdout);
+            } else if ([step[1] isEqualToString:@"wake"]) {
+                [self.pageNavigator wakePageInWebView:self.webview completion:nil];
+            } else if ([step[1] isEqualToString:@"dump"]) {
+                NSString *result = [self.webview stringByEvaluatingJavaScriptFromString:step[2]];
+                printf("[BQUAL] dump %s\n", [[result stringByReplacingOccurrencesOfString:@" || " withString:@"\n      "] UTF8String] ?: "(nil)");
+                fflush(stdout);
             } else if ([step[1] isEqualToString:@"menu-press"]) {
                 printf("[BQUAL] Menu press (fullscreen active=%d)\n", self.tabCoordinator.pageFullscreenActive);
                 fflush(stdout);
                 [self browserRemoteInputControllerHandleMenuPress];
             } else if ([step[1] isEqualToString:@"native-player"]) {
                 printf("[BQUAL] TV output: nativeBounds=%s scale=%.1f\n", NSStringFromCGRect(UIScreen.mainScreen.nativeBounds).UTF8String, UIScreen.mainScreen.nativeScale);
-                NSString *info = [self.webview stringByEvaluatingJavaScriptFromString:@"(function(){var v=document.querySelector('video'); return v ? JSON.stringify({src:v.currentSrc, t:v.currentTime}) : '';})()"];
+                NSString *info = [self.webview stringByEvaluatingJavaScriptFromString:@"(function(){var v=null,best=0; [].forEach.call(document.querySelectorAll('video'),function(x){var r=x.getBoundingClientRect(); if(x.currentSrc&&r.width*r.height>best){best=r.width*r.height; v=x;}}); return v ? JSON.stringify({src:v.currentSrc, t:v.currentTime}) : '';})()"];
                 NSDictionary *video = info.length > 0 ? [NSJSONSerialization JSONObjectWithData:[info dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
                 printf("[BQUAL] opening native player at t=%.1f quality pref=%s\n", [video[@"t"] doubleValue], [[[NSUserDefaults standardUserDefaults] stringForKey:@"NativePlayerPreferredQuality"] ?: @"auto" UTF8String]);
                 fflush(stdout);
@@ -1117,7 +1358,20 @@ static UIColor *kTextColor(void) {
                 if (@available(tvOS 13.4, *)) {
                     hdrEligible = AVPlayer.eligibleForHDRPlayback;
                 }
+                if ([player isKindOfClass:[BrowserNativeVideoPlayerViewController class]]) {
+                    printf("[BQUAL] native quality: %s\n", [(BrowserNativeVideoPlayerViewController *)player qualityStateDescription].UTF8String);
+                }
                 printf("[BQUAL] native player: presented=%s status=%ld rate=%.1f t=%.1f presentationSize=%s indicatedBitrate=%.0f observedBitrate=%.0f HDReligible=%d error=%s\n", player ? "yes" : "no", (long)player.player.currentItem.status, player.player.rate, CMTimeGetSeconds(player.player.currentTime), NSStringFromCGSize(player.player.currentItem.presentationSize).UTF8String, event.indicatedBitrate, event.observedBitrate, hdrEligible, player.player.currentItem.error.localizedDescription.UTF8String ?: "none");
+                fflush(stdout);
+            } else if ([step[1] isEqualToString:@"native-quality"]) {
+                static NSString *originalQuality = nil;
+                BrowserNativeVideoPlayerViewController *player = [self.presentedViewController isKindOfClass:[BrowserNativeVideoPlayerViewController class]] ? (BrowserNativeVideoPlayerViewController *)self.presentedViewController : nil;
+                if (originalQuality == nil) {
+                    originalQuality = [[NSUserDefaults standardUserDefaults] stringForKey:@"NativePlayerPreferredQuality"] ?: @"auto";
+                }
+                NSString *target = [step[2] isEqualToString:@"__restore__"] ? originalQuality : step[2];
+                printf("[BQUAL] native quality before select %s: %s\n", target.UTF8String, player ? [player qualityStateDescription].UTF8String : "(no player)");
+                [player selectQualityWithIdentifier:target];
                 fflush(stdout);
             } else if ([step[1] isEqualToString:@"native-close"]) {
                 [self.presentedViewController dismissViewControllerAnimated:YES completion:nil];
@@ -1253,6 +1507,7 @@ static UIColor *kTextColor(void) {
     [self runBackDiagnosticsIfRequested];
     [self runControlsWakeDiagnosticsIfRequested];
     [self runNavigationDiagnosticsIfRequested:webView];
+    [self runNavigationBenchmarkIfRequested:webView];
     [self runPlayerControlsDiagnosticsIfRequested:webView];
     if (self.tabOverviewController.visible) {
         BrowserTabViewModel *tab = [self.tabCoordinator tabForWebView:webView];

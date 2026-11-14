@@ -5,6 +5,7 @@
 #import <objc/runtime.h>
 
 #import "BrowserAdBlocker.h"
+#import "BrowserPageNavigator.h"
 
 static NSString * const kBrowserWebViewClassName = @"WKWebView";
 static NSString * const kBrowserWebViewConfigurationClassName = @"WKWebViewConfiguration";
@@ -637,6 +638,30 @@ static NSString *BrowserCrossOriginHLSScript(void) {
             "element.removeAttribute('crossorigin');"
             "try { element.load(); } catch (error) {}"
         "}, true);"
+        // Without MediaSource, players hand the stream to <video> only after the page has already
+        // called play() on the empty element. Loading the new source cancels that pending play and
+        // nothing calls play() again, so the video sat paused at 0:00. Remember that the page
+        // wanted playback and resume once the new source can play, unless it was paused since.
+        "var originalPlay = HTMLMediaElement.prototype.play, originalPause = HTMLMediaElement.prototype.pause;"
+        "HTMLMediaElement.prototype.play = function() { this.__browserWantsPlay = Date.now(); return originalPlay.apply(this, arguments); };"
+        "HTMLMediaElement.prototype.pause = function() {"
+            "if (this.readyState >= 2 && this.currentSrc) { this.__browserWantsPlay = 0; this.__browserResume = false; }"
+            "return originalPause.apply(this, arguments);"
+        "};"
+        "document.addEventListener('loadstart', function(event) {"
+            "var element = event.target;"
+            "if (!(element instanceof HTMLMediaElement)) { return; }"
+            "element.__browserResume = !!(element.__browserWantsPlay && Date.now() - element.__browserWantsPlay < 20000) || element.autoplay;"
+        "}, true);"
+        "document.addEventListener('canplay', function(event) {"
+            "var element = event.target;"
+            "if (!(element instanceof HTMLMediaElement) || !element.__browserResume) { return; }"
+            "element.__browserResume = false;"
+            "setTimeout(function() {"
+                "if (!element.paused || element.ended || !element.isConnected) { return; }"
+                "try { var promise = originalPlay.call(element); if (promise && promise.catch) { promise.catch(function() {}); } } catch (error) {}"
+            "}, 60);"
+        "}, true);"
     "})();";
 }
 
@@ -655,6 +680,66 @@ static void BrowserInstallCrossOriginHLSUserScript(id configuration) {
     if (userContentController != nil && userScript != nil) {
         ((void (*)(id, SEL, id))objc_msgSend)(userContentController, NSSelectorFromString(@"addUserScript:"), userScript);
     }
+}
+
+#pragma mark - Subtitle capture (for the native full screen player)
+
+/// Keeps the subtitles the page is using so the native full screen player can show them:
+/// the last subtitle file the page downloaded (SRT/VTT, e.g. after choosing a language in a
+/// site's player) and, for players using standard captions, the cues of the showing track.
+static NSString *BrowserSubtitleCaptureScript(void) {
+    return @"(function(){"
+        "if (window.__browserSubtitleCapture) { return; }"
+        "window.__browserSubtitleCapture = true;"
+        // Timed text that is not subtitles - e.g. WebVTT thumbnail tracks for seek previews
+        // ("thumbs/sprite-001.jpg#xywh=0,0,160,90") - must not be picked up.
+        "function looksLikeSubtitles(text) {"
+            "if (typeof text !== 'string' || text.length < 20 || text.length > 4000000) { return false; }"
+            "var sample = text.slice(0, 6000);"
+            "if (sample.indexOf('-->') === -1) { return false; }"
+            "if (/#xywh=/i.test(sample) || /^[^\\s]+\\.(jpe?g|png|webp|gif)(#[^\\s]*)?\\s*$/im.test(sample)) { return false; }"
+            "return true;"
+        "}"
+        "function isCandidate(url, type) { url = String(url || ''); return /\\.(srt|vtt|ass|ssa)(\\?|#|$)/i.test(url) || /\\/(subs?|subtitles?|captions?)\\//i.test(url) || /text\\/vtt|subrip|x-srt/i.test(type || ''); }"
+        "function remember(url, text) { if (looksLikeSubtitles(text)) { window.__browserSubtitles = { url: String(url), text: text, at: Date.now() }; } }"
+        "if (window.fetch) {"
+            "var originalFetch = window.fetch;"
+            "window.fetch = function(input) {"
+                "var promise = originalFetch.apply(this, arguments);"
+                "try {"
+                    "var requested = input && input.url ? input.url : input;"
+                    "promise.then(function(response) {"
+                        "try { if (isCandidate(response.url || requested, response.headers.get('content-type'))) { response.clone().text().then(function(text) { remember(response.url || requested, text); }, function() {}); } } catch (e) {}"
+                    "}, function() {});"
+                "} catch (e) {}"
+                "return promise;"
+            "};"
+        "}"
+        "var originalOpen = XMLHttpRequest.prototype.open, originalSend = XMLHttpRequest.prototype.send;"
+        "XMLHttpRequest.prototype.open = function(method, url) { this.__browserSubtitleURL = url; return originalOpen.apply(this, arguments); };"
+        "XMLHttpRequest.prototype.send = function() {"
+            "var xhr = this;"
+            "try { xhr.addEventListener('load', function() { try { if ((xhr.responseType === '' || xhr.responseType === 'text') && isCandidate(xhr.responseURL || xhr.__browserSubtitleURL, xhr.getResponseHeader('content-type'))) { remember(xhr.responseURL || xhr.__browserSubtitleURL, xhr.responseText); } } catch (e) {} }); } catch (e) {}"
+            "return originalSend.apply(this, arguments);"
+        "};"
+        "window.__browserSubtitlesForNativePlayer = function() {"
+            "var videos = document.querySelectorAll('video'), video = null, best = 0;"
+            "for (var i = 0; i < videos.length; i++) { var r = videos[i].getBoundingClientRect(); if (r.width * r.height > best) { best = r.width * r.height; video = videos[i]; } }"
+            "if (video && video.textTracks) {"
+                "for (var t = 0; t < video.textTracks.length; t++) {"
+                    "var track = video.textTracks[t];"
+                    "if (track.mode === 'showing' && track.cues && track.cues.length) {"
+                        "var cues = [];"
+                        "for (var c = 0; c < track.cues.length && c < 20000; c++) { var cue = track.cues[c]; cues.push([cue.startTime, cue.endTime, cue.text || '']); }"
+                        "return JSON.stringify({ label: track.label || track.language || 'Subtitles', cues: cues });"
+                    "}"
+                "}"
+            "}"
+            "var captured = window.__browserSubtitles;"
+            "if (captured) { var name = decodeURIComponent(String(captured.url).split('?')[0].split('/').pop() || ''); return JSON.stringify({ label: 'Website subtitles', source: name, text: captured.text }); }"
+            "return '';"
+        "};"
+    "})();";
 }
 
 #pragma mark - Fullscreen API replacement
@@ -689,6 +774,8 @@ static NSString *BrowserFullscreenPolyfillScript(void) {
         "function playerContainerFor(video) {"
             "var vr = video.getBoundingClientRect(); var node = video.parentElement; var best = video;"
             "for (var depth = 0; node && node !== document.body && depth < 4; depth++, node = node.parentElement) {"
+                // display:contents wrappers draw no box, so they cannot be stretched over the screen.
+                "if (getComputedStyle(node).display === 'contents') { break; }"
                 "var r = node.getBoundingClientRect();"
                 "if (r.width * r.height > Math.max(1, vr.width * vr.height) * 1.6) { break; }"
                 "best = node;"
@@ -726,16 +813,15 @@ static NSString *BrowserFullscreenPolyfillScript(void) {
         "['fullscreenElement', 'webkitFullscreenElement', 'webkitCurrentFullScreenElement'].forEach(function(name) { getter(Document.prototype, name, function() { return current; }); });"
         "['fullscreenEnabled', 'webkitFullscreenEnabled', 'webkitFullScreenEnabled'].forEach(function(name) { getter(Document.prototype, name, function() { return true; }); });"
         "['fullscreen', 'webkitIsFullScreen'].forEach(function(name) { getter(Document.prototype, name, function() { return !!current; }); });"
-        // iOS-style players call video.webkitEnterFullscreen(); on tvOS that is the black native path.
-        "HTMLVideoElement.prototype.webkitEnterFullscreen = function() {"
-            "var video = this; enter(playerContainerFor(video));"
-            "fire(video, ['webkitbeginfullscreen']);"
-        "};"
-        "HTMLVideoElement.prototype.webkitEnterFullScreen = HTMLVideoElement.prototype.webkitEnterFullscreen;"
-        "HTMLVideoElement.prototype.webkitExitFullscreen = function() { leave(false); fire(this, ['webkitendfullscreen']); };"
-        "HTMLVideoElement.prototype.webkitExitFullScreen = HTMLVideoElement.prototype.webkitExitFullscreen;"
-        "getter(HTMLVideoElement.prototype, 'webkitDisplayingFullscreen', function() { return !!current && (current === this || current.contains(this)); });"
-        "getter(HTMLVideoElement.prototype, 'webkitSupportsFullscreen', function() { return true; });"
+        // Hide the iOS-only video fullscreen (webkitEnterFullscreen & co.). On tvOS it is the black
+        // native path, and players that see it take their iOS route, which switches off their own
+        // subtitles/controls in favour of native captions. Without it they use the standard
+        // requestFullscreen() above on their player, keeping their subtitles and controls.
+        "['webkitEnterFullscreen', 'webkitEnterFullScreen', 'webkitExitFullscreen', 'webkitExitFullScreen'].forEach(function(name) {"
+            "try { Object.defineProperty(HTMLVideoElement.prototype, name, { configurable: true, writable: true, value: undefined }); } catch (e) {}"
+        "});"
+        "getter(HTMLVideoElement.prototype, 'webkitSupportsFullscreen', function() { return false; });"
+        "getter(HTMLVideoElement.prototype, 'webkitDisplayingFullscreen', function() { return false; });"
         "window.__browserExitFullscreen = function() { leave(false); };"
         "new MutationObserver(function() { if (current && !document.contains(current)) { leave(false); } }).observe(document.documentElement, { childList: true, subtree: true });"
     "})();";
@@ -968,6 +1054,8 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
 @property (nonatomic) BOOL observingProgress;
 @property (nonatomic) NSTimer *diagnosticsTimer;
 @property (nonatomic, weak) id userContentController;
+@property (nonatomic, copy) NSString *appInitiatedURLString;
+@property (nonatomic) CFTimeInterval appInitiatedTimestamp;
 @property (nonatomic) NSUInteger diagnosticsTicks;
 
 @end
@@ -1017,6 +1105,14 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
     if (configuration != nil && [configuration respondsToSelector:allowsInlineMediaPlaybackSelector]) {
         ((void (*)(id, SEL, BOOL))objc_msgSend)(configuration, allowsInlineMediaPlaybackSelector, allowsInlineMediaPlayback);
     }
+    // tvOS WebKit defaults to requiring a user gesture for every video with sound. Players load
+    // their source a few seconds after the Play click and then call play(), which is no longer
+    // inside the gesture, so WebKit refused it and the video stayed paused at 0:00 (only the
+    // native full screen player could play it). WKAudiovisualMediaTypeNone = 0 lets pages play.
+    SEL mediaTypesRequiringUserActionSelector = NSSelectorFromString(@"setMediaTypesRequiringUserActionForPlayback:");
+    if (configuration != nil && [configuration respondsToSelector:mediaTypesRequiringUserActionSelector]) {
+        ((void (*)(id, SEL, NSUInteger))objc_msgSend)(configuration, mediaTypesRequiringUserActionSelector, 0);
+    }
     BrowserConfigurePrivateMediaPreferences(configuration);
     BrowserInstallYouTubeCaptureUserScript(configuration);
     BrowserInstallCrossOriginHLSUserScript(configuration);
@@ -1032,6 +1128,13 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
             id userScript = ((id (*)(id, SEL))objc_msgSend)((id)userScriptClass, @selector(alloc));
             userScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(userScript, userScriptInitializer, BrowserFullscreenPolyfillScript(), 0, YES);
             ((void (*)(id, SEL, id))objc_msgSend)(userContentController, NSSelectorFromString(@"addUserScript:"), userScript);
+            // Remote navigation library, ready before the first arrow press (document end, main frame).
+            id navigatorScript = ((id (*)(id, SEL))objc_msgSend)((id)userScriptClass, @selector(alloc));
+            navigatorScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(navigatorScript, userScriptInitializer, [BrowserPageNavigator libraryScript], 1, YES);
+            ((void (*)(id, SEL, id))objc_msgSend)(userContentController, NSSelectorFromString(@"addUserScript:"), navigatorScript);
+            id subtitleScript = ((id (*)(id, SEL))objc_msgSend)((id)userScriptClass, @selector(alloc));
+            subtitleScript = ((id (*)(id, SEL, id, NSInteger, BOOL))objc_msgSend)(subtitleScript, userScriptInitializer, BrowserSubtitleCaptureScript(), 0, YES);
+            ((void (*)(id, SEL, id))objc_msgSend)(userContentController, NSSelectorFromString(@"addUserScript:"), subtitleScript);
         }
         SEL addHandlerSelector = NSSelectorFromString(@"addScriptMessageHandler:name:");
         if ([userContentController respondsToSelector:addHandlerSelector]) {
@@ -1185,6 +1288,8 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
 }
 
 - (void)loadRequest:(NSURLRequest *)request {
+    self.appInitiatedURLString = request.URL.absoluteString;
+    self.appInitiatedTimestamp = CACurrentMediaTime();
     if (request == nil || self.runtimeWebView == nil) {
         return;
     }
@@ -1511,8 +1616,20 @@ static void BrowserInstallMediaDiagnosticsUserScript(id configuration) {
     }];
 }
 
+- (BOOL)isAppInitiatedRequest:(NSURLRequest *)request {
+    // The app's own load, or a server redirect right after it.
+    if (request.URL == nil || self.appInitiatedURLString.length == 0) {
+        return NO;
+    }
+    return [request.URL.absoluteString isEqualToString:self.appInitiatedURLString] ||
+        (CACurrentMediaTime() - self.appInitiatedTimestamp) < 3.0;
+}
+
 - (void)webView:(id)webView didFinishNavigation:(id)navigation {
     [self startMediaDiagnosticsIfNeeded];
+    if ([BrowserAdBlocker sharedBlocker].enabled) {
+        [self evaluateJavaScript:[BrowserAdBlocker overlayAdSweeperScript] completionHandler:nil];
+    }
     self.loading = NO;
     self.lastTitle = [self title];
     self.lastRequest = [self request];

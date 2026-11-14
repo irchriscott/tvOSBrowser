@@ -199,6 +199,16 @@ static BOOL const kBrowserYouTubeNativeExtractionEnabled = NO;
                                                                                                                   requestHeaders:headers
                                                                                                                          cookies:nil];
     playerViewController.startTime = startTime;
+    // Bring the website's subtitles along (the file the site loaded, or a player's showing captions).
+    NSString *subtitleJSON = [webView stringByEvaluatingJavaScriptFromString:@"window.__browserSubtitlesForNativePlayer ? window.__browserSubtitlesForNativePlayer() : ''"];
+    NSDictionary *subtitles = subtitleJSON.length > 0 ? [NSJSONSerialization JSONObjectWithData:[subtitleJSON dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
+    if ([subtitles isKindOfClass:[NSDictionary class]]) {
+        if ([subtitles[@"cues"] isKindOfClass:[NSArray class]]) {
+            [playerViewController setSubtitleCues:subtitles[@"cues"] label:subtitles[@"label"]];
+        } else if ([subtitles[@"text"] isKindOfClass:[NSString class]]) {
+            [playerViewController setSubtitleText:subtitles[@"text"] label:subtitles[@"label"]];
+        }
+    }
     __weak BrowserWebView *weakWebView = webView;
     NSString *sourceURLString = URL.absoluteString ?: @"";
     playerViewController.dismissHandler = ^(NSTimeInterval currentTime) {

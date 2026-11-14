@@ -20,6 +20,13 @@ extern NSNotificationName const BrowserAdBlockerDidBlockPopupNotification;
 /// YES when the URL's host is on the ad/tracker list.
 - (BOOL)isBlockedURL:(nullable NSURL *)URL;
 
+/// YES for hosts on throwaway domain endings that rotating ad networks favour (.cfd, .cyou...).
+- (BOOL)isSuspiciousAdDomainURL:(nullable NSURL *)URL;
+
+/// Page script that removes injected overlay ads (fake alerts, in-page push). Run on each page
+/// while the blocker is enabled.
++ (NSString *)overlayAdSweeperScript;
+
 /// Whether a request to open a new tab/window should be refused.
 /// navigationType is WebKit's (0 = link activated, -1 = other/script).
 - (BOOL)shouldBlockPopupRequest:(nullable NSURLRequest *)request

@@ -6,7 +6,22 @@ NSNotificationName const BrowserAdBlockerDidBlockPopupNotification = @"BrowserAd
 
 static NSString * const kAdBlockerEnabledDefaultsKey = @"AdBlockerEnabled";
 /// Bump when the rules change so the compiled list is rebuilt.
-static NSString * const kAdBlockerRuleListIdentifier = @"BrowserAdBlocker-v1";
+static NSString * const kAdBlockerRuleListIdentifier = @"BrowserAdBlocker-v2";
+
+/// Throwaway domain endings used by rotating ad/pop-under networks (they register new random
+/// names daily, so they cannot be listed by name). Only third-party *scripts* on these endings
+/// are blocked, so visiting such a site directly still works.
+static NSArray<NSString *> *BrowserAdBlockerSuspiciousTLDs(void) {
+    return @[@"cfd", @"cyou", @"qpon", @"sbs", @"icu", @"bond", @"quest", @"autos", @"boats", @"hair",
+             @"monster", @"makeup", @"skin", @"homes", @"motorcycles", @"yachts", @"beauty", @"mom"];
+}
+
+/// Specific ad scripts on hosts that also serve useful files (blocked by path only).
+static NSArray<NSString *> *BrowserAdBlockerPathFilters(void) {
+    return @[
+        @"^[^:]+://+www\\.vidy\\.st/scripts/",   // movy.sx pop-under / ad loader (users.vidy.st stays allowed)
+    ];
+}
 
 /// Ad, pop-under and tracking hosts. Matching includes subdomains.
 /// Deliberately conservative: CDNs, video hosts, login providers and tag
@@ -36,6 +51,9 @@ static NSArray<NSString *> *BrowserAdBlockerHosts(void) {
         @"pushnami.com", @"pushwhy.com", @"realsrv.com", @"magsrv.com", @"tsyndicate.net",
         @"syndication.realsrv.com", @"popunder.net", @"popadscdn.net", @"poptm.com",
         @"adspyglass.com", @"ero-advertising.com", @"plugrush.com", @"notifpush.com",
+        // Seen on movy.sx (in-page push / fake alert networks)
+        @"doomsarchaic.com", @"k1nm7c66rh4fgh.cfd", @"smockeddesmoid.qpon", @"sciageuncorks.cyou",
+        @"gallaupcoil.cfd",
         // Trackers
         @"scorecardresearch.com", @"quantserve.com", @"hotjar.com", @"mouseflow.com",
         @"crazyegg.com", @"chartbeat.com", @"newrelic.com", @"nr-data.net", @"bluekai.com",
@@ -60,6 +78,20 @@ static NSString *BrowserAdBlockerRuleListJSON(void) {
     for (NSString *host in BrowserAdBlockerHosts()) {
         // Same shape Safari content blockers use: scheme, optional subdomains, host, then : or /.
         NSString *filter = [NSString stringWithFormat:@"^[^:]+://+([^:/]+\\.)?%@[:/]", BrowserAdBlockerRegexEscapedHost(host)];
+        [rules addObject:@{
+            @"trigger": @{ @"url-filter": filter, @"load-type": @[@"third-party"] },
+            @"action": @{ @"type": @"block" },
+        }];
+    }
+    for (NSString *tld in BrowserAdBlockerSuspiciousTLDs()) {
+        [rules addObject:@{
+            @"trigger": @{ @"url-filter": [NSString stringWithFormat:@"^[^:]+://+[^:/]+\\.%@[:/]", tld],
+                           @"load-type": @[@"third-party"],
+                           @"resource-type": @[@"script", @"popup"] },
+            @"action": @{ @"type": @"block" },
+        }];
+    }
+    for (NSString *filter in BrowserAdBlockerPathFilters()) {
         [rules addObject:@{
             @"trigger": @{ @"url-filter": filter, @"load-type": @[@"third-party"] },
             @"action": @{ @"type": @"block" },
@@ -207,7 +239,53 @@ static NSString *BrowserRegistrableDomain(NSString *host) {
     });
 }
 
+#pragma mark Overlay ads
+
++ (NSString *)overlayAdSweeperScript {
+    return @"(function(){"
+        "if (window.__browserAdSweeper) { return; }"
+        "window.__browserAdSweeper = true;"
+        "window.__browserAdsRemoved = window.__browserAdsRemoved || 0;"
+        // Real site dialogs do not stack at the browser's maximum layer; injected ad layers do.
+        "var TOP_LAYER = 2147480000;"
+        "function isBrowserElement(el) { return el.hasAttribute && (el.hasAttribute('data-browser-focus-ring') || el.hasAttribute('data-browser-fullscreen')); }"
+        "function adFrame(frame) {"
+            "var src = (frame.getAttribute('src') || '').trim();"
+            "if (!src || src === 'about:blank' || /^javascript:/i.test(src) || frame.hasAttribute('srcdoc')) { return true; }"
+            "try { return new URL(src, location.href).host !== location.host; } catch (e) { return true; }"
+        "}"
+        "function isOverlayAd(el) {"
+            "if (!el || el.nodeType !== 1 || isBrowserElement(el) || el === document.body) { return false; }"
+            "var tag = el.tagName; if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'HEAD' || tag === 'META') { return false; }"
+            "var cs = getComputedStyle(el);"
+            "if (cs.position !== 'fixed' && cs.position !== 'absolute') { return false; }"
+            "if ((parseInt(cs.zIndex, 10) || 0) < TOP_LAYER) { return false; }"
+            "if (el.parentNode === document.documentElement || tag === 'A' || tag === 'IFRAME' && adFrame(el)) { return true; }"
+            "var frames = el.querySelectorAll('iframe');"
+            "for (var i = 0; i < frames.length; i++) { if (adFrame(frames[i])) { return true; } }"
+            "return false;"
+        "}"
+        "function sweep() {"
+            "var candidates = [];"
+            "[document.documentElement, document.body].forEach(function(parent) { if (parent) { for (var i = 0; i < parent.children.length; i++) { candidates.push(parent.children[i]); } } });"
+            "candidates.forEach(function(el) { if (isOverlayAd(el)) { el.remove(); window.__browserAdsRemoved++; } });"
+        "}"
+        "sweep();"
+        "var observer = new MutationObserver(function() { sweep(); });"
+        "observer.observe(document.documentElement, { childList: true });"
+        "if (document.body) { observer.observe(document.body, { childList: true }); }"
+        "document.addEventListener('DOMContentLoaded', function() { if (document.body) { observer.observe(document.body, { childList: true }); } sweep(); });"
+        "setInterval(sweep, 1500);"
+    "})();";
+}
+
 #pragma mark Hosts & pop-ups
+
+- (BOOL)isSuspiciousAdDomainURL:(NSURL *)URL {
+    NSString *host = URL.host.lowercaseString;
+    NSString *tld = [host componentsSeparatedByString:@"."].lastObject;
+    return tld.length > 0 && [BrowserAdBlockerSuspiciousTLDs() containsObject:tld];
+}
 
 - (BOOL)isBlockedURL:(NSURL *)URL {
     NSString *host = URL.host.lowercaseString;
@@ -229,7 +307,7 @@ static NSString *BrowserRegistrableDomain(NSString *host) {
         return NO;
     }
     BOOL block = NO;
-    if ([self isBlockedURL:request.URL]) {
+    if ([self isBlockedURL:request.URL] || [self isSuspiciousAdDomainURL:request.URL]) {
         block = YES;
     } else if (navigationType != 0) {
         // Opened by script rather than a link: pop-unders send you to another site.
