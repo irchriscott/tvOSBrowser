@@ -25,10 +25,6 @@
 		A1B49A552D68143D001D58A1 /* BrowserMenuCoordinator.m in Sources */ = {isa = PBXBuildFile; fileRef = A1B49A542D68143D001D58A1 /* BrowserMenuCoordinator.m */; };
 		A1B49A582D6828D4001D58A1 /* BrowserSessionStore.m in Sources */ = {isa = PBXBuildFile; fileRef = A1B49A572D6828D4001D58A1 /* BrowserSessionStore.m */; };
 		A1B49A5B2D684000001D58A1 /* BrowserTopBarView.m in Sources */ = {isa = PBXBuildFile; fileRef = A1B49A5A2D684000001D58A1 /* BrowserTopBarView.m */; };
-		C1A0B0032F00000000000004 /* BrowserPageNavigator.m in Sources */ = {isa = PBXBuildFile; fileRef = C1A0B0022F00000000000004 /* BrowserPageNavigator.m */; };
-		C1A0B0032F00000000000003 /* BrowserAdBlocker.m in Sources */ = {isa = PBXBuildFile; fileRef = C1A0B0022F00000000000003 /* BrowserAdBlocker.m */; };
-		C1A0B0032F00000000000002 /* BrowserHomeView.m in Sources */ = {isa = PBXBuildFile; fileRef = C1A0B0022F00000000000002 /* BrowserHomeView.m */; };
-		C1A0B0032F00000000000001 /* BrowserHomeStore.m in Sources */ = {isa = PBXBuildFile; fileRef = C1A0B0022F00000000000001 /* BrowserHomeStore.m */; };
 		A1B49A5D2D69F100001D58A1 /* WebCoreNSURLSessionTaskTransactionMetrics+AddPrivacyStance.m in Sources */ = {isa = PBXBuildFile; fileRef = A1B49A5C2D69F100001D58A1 /* WebCoreNSURLSessionTaskTransactionMetrics+AddPrivacyStance.m */; };
 		A1B49A5F2D69F900001D58A1 /* WebAVPlayerViewController+FullscreenSubviewHack.m in Sources */ = {isa = PBXBuildFile; fileRef = A1B49A5E2D69F900001D58A1 /* WebAVPlayerViewController+FullscreenSubviewHack.m */; };
 		A1B49A612D6A1000001D58A1 /* BrowserWKWebViewProofOfConceptViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = A1B49A602D6A1000001D58A1 /* BrowserWKWebViewProofOfConceptViewController.m */; };
@@ -50,6 +46,10 @@
 		B002B86D1BAE420500C744AF /* ViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = B002B86C1BAE420500C744AF /* ViewController.m */; };
 		B002B8701BAE420500C744AF /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = B002B86E1BAE420500C744AF /* Main.storyboard */; };
 		B002B8721BAE420500C744AF /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B002B8711BAE420500C744AF /* Assets.xcassets */; };
+		C1A0B0032F00000000000001 /* BrowserHomeStore.m in Sources */ = {isa = PBXBuildFile; fileRef = C1A0B0022F00000000000001 /* BrowserHomeStore.m */; };
+		C1A0B0032F00000000000002 /* BrowserHomeView.m in Sources */ = {isa = PBXBuildFile; fileRef = C1A0B0022F00000000000002 /* BrowserHomeView.m */; };
+		C1A0B0032F00000000000003 /* BrowserAdBlocker.m in Sources */ = {isa = PBXBuildFile; fileRef = C1A0B0022F00000000000003 /* BrowserAdBlocker.m */; };
+		C1A0B0032F00000000000004 /* BrowserPageNavigator.m in Sources */ = {isa = PBXBuildFile; fileRef = C1A0B0022F00000000000004 /* BrowserPageNavigator.m */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -75,14 +75,6 @@
 		A1B49A542D68143D001D58A1 /* BrowserMenuCoordinator.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserMenuCoordinator.m; sourceTree = "<group>"; };
 		A1B49A562D6828D4001D58A1 /* BrowserSessionStore.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BrowserSessionStore.h; sourceTree = "<group>"; };
 		A1B49A572D6828D4001D58A1 /* BrowserSessionStore.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserSessionStore.m; sourceTree = "<group>"; };
-		C1A0B0012F00000000000001 /* BrowserHomeStore.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BrowserHomeStore.h; sourceTree = "<group>"; };
-		C1A0B0022F00000000000001 /* BrowserHomeStore.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserHomeStore.m; sourceTree = "<group>"; };
-		C1A0B0012F00000000000002 /* BrowserHomeView.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BrowserHomeView.h; sourceTree = "<group>"; };
-		C1A0B0022F00000000000002 /* BrowserHomeView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserHomeView.m; sourceTree = "<group>"; };
-		C1A0B0012F00000000000003 /* BrowserAdBlocker.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BrowserAdBlocker.h; sourceTree = "<group>"; };
-		C1A0B0022F00000000000003 /* BrowserAdBlocker.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserAdBlocker.m; sourceTree = "<group>"; };
-		C1A0B0012F00000000000004 /* BrowserPageNavigator.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BrowserPageNavigator.h; sourceTree = "<group>"; };
-		C1A0B0022F00000000000004 /* BrowserPageNavigator.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserPageNavigator.m; sourceTree = "<group>"; };
 		A1B49A592D684000001D58A1 /* BrowserTopBarView.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BrowserTopBarView.h; sourceTree = "<group>"; };
 		A1B49A5A2D684000001D58A1 /* BrowserTopBarView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserTopBarView.m; sourceTree = "<group>"; };
 		A1B49A5C2D69F100001D58A1 /* WebCoreNSURLSessionTaskTransactionMetrics+AddPrivacyStance.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "WebCoreNSURLSessionTaskTransactionMetrics+AddPrivacyStance.m"; sourceTree = "<group>"; };
@@ -122,6 +114,14 @@
 		B002B8711BAE420500C744AF /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		B002B8731BAE420500C744AF /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B0F6B4611BAEBF9900E2F26B /* ../README.mdown */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = net.daringfireball.markdown; path = ../README.mdown; sourceTree = "<group>"; };
+		C1A0B0012F00000000000001 /* BrowserHomeStore.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BrowserHomeStore.h; sourceTree = "<group>"; };
+		C1A0B0012F00000000000002 /* BrowserHomeView.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BrowserHomeView.h; sourceTree = "<group>"; };
+		C1A0B0012F00000000000003 /* BrowserAdBlocker.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BrowserAdBlocker.h; sourceTree = "<group>"; };
+		C1A0B0012F00000000000004 /* BrowserPageNavigator.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BrowserPageNavigator.h; sourceTree = "<group>"; };
+		C1A0B0022F00000000000001 /* BrowserHomeStore.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserHomeStore.m; sourceTree = "<group>"; };
+		C1A0B0022F00000000000002 /* BrowserHomeView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserHomeView.m; sourceTree = "<group>"; };
+		C1A0B0022F00000000000003 /* BrowserAdBlocker.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserAdBlocker.m; sourceTree = "<group>"; };
+		C1A0B0022F00000000000004 /* BrowserPageNavigator.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BrowserPageNavigator.m; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -594,7 +594,7 @@
 				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CURRENT_PROJECT_VERSION = 3000;
-				DEVELOPMENT_TEAM = FNNB96NC39;
+				DEVELOPMENT_TEAM = HCY77TJ2TG;
 				EMBED_ASSET_PACKS_IN_PRODUCT_BUNDLE = YES;
 				ENABLE_ON_DEMAND_RESOURCES = NO;
 				FRAMEWORK_SEARCH_PATHS = "";
@@ -604,7 +604,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 2.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.chriscott.tvbrowser;
+				PRODUCT_BUNDLE_IDENTIFIER = com.haxyscott.tvbrowser;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SCAN_ALL_SOURCE_FILES_FOR_INCLUDES = NO;
 				TVOS_DEPLOYMENT_TARGET = 15.6;
@@ -619,7 +619,7 @@
 				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CURRENT_PROJECT_VERSION = 3000;
-				DEVELOPMENT_TEAM = FNNB96NC39;
+				DEVELOPMENT_TEAM = HCY77TJ2TG;
 				EMBED_ASSET_PACKS_IN_PRODUCT_BUNDLE = YES;
 				ENABLE_ON_DEMAND_RESOURCES = NO;
 				FRAMEWORK_SEARCH_PATHS = "";
@@ -629,7 +629,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 2.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.chriscott.tvbrowser;
+				PRODUCT_BUNDLE_IDENTIFIER = com.haxyscott.tvbrowser;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SCAN_ALL_SOURCE_FILES_FOR_INCLUDES = NO;
 				TVOS_DEPLOYMENT_TARGET = 15.6;
